@@ -492,7 +492,8 @@ erDiagram
 ```mermaid
 erDiagram
     USERS ||--o{ ATTENDANCE_LOGS : checks_in
-    ATTENDANCE_CALENDAR_CONFIGS ||--o{ ATTENDANCE_LOGS : "rewards via"
+    ATTENDANCE_REWARD_POLICIES ||--o{ ATTENDANCE_LOGS : "generates reward via"
+    ATTENDANCE_REWARD_POLICIES ||--o{ ATTENDANCE_LUCKY_BOX_OUTCOMES : defines
     USERS ||--o{ COUPON_REDEMPTIONS : redeems
     COUPONS ||--o{ COUPON_REDEMPTIONS : "redeemed by"
     USERS ||--o{ REFERRALS : refers
@@ -501,7 +502,6 @@ erDiagram
     MISSION_DEFINITIONS ||--o{ USER_MISSIONS : defines
     USERS ||--|| USER_LOYALTY_STATUS : has
     LOYALTY_TIERS ||--o{ USER_LOYALTY_STATUS : "achieved by"
-    LOYALTY_TIERS ||--o{ ATTENDANCE_CALENDAR_CONFIGS : "scopes"
     USERS ||--o{ FREE_DRAW_TICKETS : holds
     LOYALTY_TIERS ||--o{ COSMETIC_ITEMS : "unlocks at"
     USERS ||--o{ USER_COSMETIC_UNLOCKS : owns
@@ -513,20 +513,39 @@ erDiagram
         bigint user_id FK
         date check_in_date UK "user_id+date 복합 UNIQUE"
         int streak_count
-        int calendar_day_number "캘린더 순환 몇 일차 보상을 받았는지"
-        varchar tier_code_at_checkin "체크인 시점에 적용된 등급 코드 스냅샷(감사/분석용)"
-        numeric reward_points
+        int attendance_day_number "가입/최근 리셋 이후 누적 출석일수 — 마일스톤(10/20일차 등) 판정 기준"
+        varchar reward_source "dynamic, milestone, lucky_box"
+        varchar reward_type "bonus_credit, free_draw_ticket"
+        numeric reward_value
+        numeric activity_score_snapshot "보상 계산에 쓰인 가중합 점수, 재현/감사용"
         timestamptz created_at
     }
 
-    ATTENDANCE_CALENDAR_CONFIGS {
+    ATTENDANCE_REWARD_POLICIES {
         bigint id PK
-        varchar tier_code "이 캘린더가 적용되는 등급 — §8 '이중 출석부'의 실체, LOYALTY_TIERS.tier_code 참조"
-        int day_number "1~N, 연속출석 순환 주기 내 순번"
-        varchar reward_type "bonus_credit, free_draw_ticket, cosmetic_item"
-        numeric reward_value "reward_type=cosmetic_item일 땐 NULL"
-        bigint cosmetic_item_id FK "reward_type=cosmetic_item일 때만"
-        varchar description
+        numeric base_reward_amount "활동 없는 최소 기준 보상"
+        numeric payment_recency_weight "최근 결제 이력 반영 가중치"
+        numeric streak_weight "연속 출석일수 반영 가중치"
+        numeric engagement_weight "뽑기 횟수/미션 완료 등 기타 이용 반영 가중치"
+        int decay_start_days "무결제 상태 지속 시 감소가 시작되는 시점"
+        int decay_window_days "감소가 바닥값까지 도달하는 기간 — 길게 잡아 하루 변화폭을 체감 못하게 함"
+        numeric decay_floor_multiplier "바닥값, 예: 0.7 — 뚝 떨어지지 않고 은근히만 줄어듦"
+        jsonb milestone_days "예: [7, 10, 20, 30, 50, 100]"
+        numeric milestone_bonus_multiplier "마일스톤 날 보상 배율"
+        int long_term_free_threshold_days "이 일수 이상 무결제 지속 시 럭키박스 방식으로 전환"
+        boolean long_term_free_lucky_box_enabled
+        boolean is_active
+        timestamptz valid_from
+        timestamptz valid_to
+    }
+
+    ATTENDANCE_LUCKY_BOX_OUTCOMES {
+        bigint id PK
+        bigint policy_id FK
+        varchar outcome_code "small, medium, jackpot"
+        numeric probability "policy_id 내 합계 1.0"
+        varchar reward_type "bonus_credit, free_draw_ticket"
+        numeric reward_value
         boolean is_active
     }
 
@@ -593,21 +612,18 @@ erDiagram
 
     LOYALTY_TIERS {
         bigint id PK
-        varchar tier_code UK "free_new, free_longterm, bronze, silver, gold, vip"
-        int tier_rank "정렬/승급 판정용 순서, free_longterm은 free_new보다 낮은 혜택이지만 rank는 동일 그룹"
-        numeric min_cumulative_charge "누적 유상 충전액 기준, free 계열은 0"
-        int max_free_days "free_new 전용 — 가입/최초체크인 후 이 일수가 지나도 무충전이면 free_longterm으로 자동 강등"
-        numeric attendance_reward_multiplier "해당 등급 출석 보상 배율, 예: free_longterm=0.3, gold=2.0"
-        jsonb benefits "배송비 할인율, 전용 이벤트, 등급전용 팩 접근 등"
+        varchar tier_code UK "basic, bronze, silver, gold, vip — 순수 결제 등급 사다리"
+        numeric min_cumulative_charge "누적 유상 충전액 기준, basic=0"
+        jsonb benefits "배송비 할인율, 전용 이벤트, 등급전용 팩 접근 등 — 결제 이력과 무관한 출석 보상과는 별개"
     }
 
     USER_LOYALTY_STATUS {
         bigint id PK
         bigint user_id FK UK
         bigint tier_id FK
-        numeric cumulative_charge_amount "누적 유상 충전액"
+        numeric cumulative_charge_amount "누적 유상 충전액 — 결제등급과 출석 동적 보상 계산 양쪽의 입력값"
         numeric cumulative_free_offline_bonus "오프라인 체크인으로 받은 무상 적립금 누적, §12 채굴방지 규칙에 사용"
-        date free_tier_started_at "free_new 진입일 — max_free_days 경과 판정 기준"
+        timestamptz last_charge_at "가장 최근 유상 충전 시각 — 출석 보상 decay 계산 기준"
         timestamptz tier_achieved_at
         timestamptz updated_at
     }
@@ -628,7 +644,7 @@ erDiagram
         bigint id PK
         bigint user_id FK
         bigint cosmetic_item_id FK
-        varchar source "tier_achieved, attendance_calendar, event, admin_grant"
+        varchar source "tier_achieved, event, admin_grant — 출석 경로 없음(§8 참고)"
         bigint source_ref_id
         timestamptz unlocked_at
     }
@@ -661,11 +677,17 @@ erDiagram
 - **미션 시스템**: `mission_definitions`는 관리자가 트리거 조건과 보상을 정의하는 템플릿, `user_missions`가 유저별 진행도를 추적. 뽑기/충전/친구초대 등 이벤트 발생 시 해당 유저의 `user_missions.progress_count`를 증가시키고 `target_count` 도달 시 `completed`로 전환(보상은 별도 청구 API로 명시적 수령 — 자동 지급하지 않아 "받았는지 모르고 방치" 방지 및 UX 상 보상 연출 여지 확보).
 - **무료 뽑기권**: `free_draw_tickets`는 출석/미션/쿠폰으로 지급되는 "뽑기 1회 무료" 아이템. `pack_scope`로 특정 게임/팩에만 쓰게 제한 가능. 뽑기 API(`POST /oripa-packs/{id}/draws`)가 `ticket_id`를 받으면 포인트 차감 대신 이 티켓을 소비 — 상세는 API_SPEC.md §3, §6 참고.
 
-**설계 포인트 — 결제금액별 "이중 출석부" & 유료 전환 유도**
-- **등급별 출석부 분리**: `attendance_calendar_configs.tier_code`로 등급마다 완전히 다른 캘린더를 구성한다 — 동일한 날짜(`day_number`)라도 `free_new`는 소량 적립금, `gold`/`vip`는 무료뽑기권이나 코스메틱 아이템(`reward_type=cosmetic_item`)을 받도록 설계 가능. `attendance_logs.tier_code_at_checkin`은 체크인 당시 어느 캘린더가 적용됐는지 스냅샷으로 남긴다.
-- **가입 초반 유인 → 장기 무료 이용자 혜택 감소**: `loyalty_tiers.max_free_days`(예: 30일)를 `free_new` 등급에만 설정 — `user_loyalty_status.free_tier_started_at`으로부터 이 기간이 지났는데도 `cumulative_charge_amount = 0`이면 배치가 자동으로 `free_longterm` 등급(`attendance_reward_multiplier`가 훨씬 낮음, 예: 0.3)으로 강등한다. 신규 유저에게는 넉넉한 출석 보상으로 습관을 들이게 하되, 결제 없이 장기간 무료로만 버티는 유저는 자연스럽게 보상이 줄어들어 유료 전환 압박이 생긴다.
-- **결제 등급 = 코스메틱 해금**: `loyalty_tiers`가 승급(`min_cumulative_charge` 도달)하면 `cosmetic_items.min_tier_required`가 그 등급 이하인 항목들이 배치/트리거로 `user_cosmetic_unlocks`에 자동 지급된다. 정적 이미지뿐 아니라 `asset_format=webp/gif`인 애니메이션 프로필 장식(`item_type=animated_deco`)을 등급 전용으로 제공 — 실물/포인트 보상이 아닌 "과시형" 보상이라 원가 부담 없이 결제 유도 효과를 낼 수 있다.
-- `user_profile_equipment`는 유저가 보유한(`user_cosmetic_unlocks`) 항목 중 실제로 착용 중인 것만 가리킨다 — 소유와 착용을 분리해 다회선택형 코스메틱 확장에 대비.
+**설계 포인트 — 활동 기반 동적 출석 보상 & "눈치채지 못하게" 줄어드는 무결제 보상**
+- 고정된 날짜별 보상 테이블 대신, 매 체크인마다 `attendance_reward_policies`의 가중치로 그 유저의 **결제 이력**(`last_charge_at`/`cumulative_charge_amount`), **연속 출석일수**(`streak_count`), **기타 이용도**(뽑기 횟수, 완료한 미션 수 등)를 합산한 `activity_score`를 계산해 보상을 그때그때 산출한다. `attendance_logs.activity_score_snapshot`에 계산근거를 남겨 재현·감사가 가능하다.
+- **서서히, 감지 못하게 감소**: 무결제 상태가 `decay_start_days`(예: 15일)를 넘기면 그 즉시 확 줄이는 게 아니라, `decay_window_days`(예: 90일)에 걸쳐 서서히 `decay_floor_multiplier`(예: 0.7)까지 하락시킨다 — 하루 변화폭이 1% 미만이라 유저가 "오늘 갑자기 줄었다"고 체감하지 못한다. 절벽형 등급 강등은 두지 않는다.
+- **마일스톤 스파이크**: `milestone_days`(예: 7·10·20·30·50·100일차)에는 결제 여부와 무관하게 `milestone_bonus_multiplier`를 곱한 고가치 보상을 지급해 장기 이탈을 방지하고 "다음 마일스톤까지 채워야지" 하는 동기를 유지시킨다.
+- **장기 무결제자 = 확정형 → 확률형(럭키박스) 전환**: `long_term_free_threshold_days`를 넘긴 무결제 유저는 보상 방식이 `attendance_lucky_box_outcomes`의 확률 테이블로 전환된다. 예: 90% 확률로 소액, 9% 확률로 중간값, 1% 확률로 잭팟(고가 무료뽑기권) — 산술적 기댓값은 일반 확정형 보상보다 높게 설계할 수 있지만, 실제로는 대부분(90%) 소액만 받으므로 체감가치·실사용 필요성은 낮다. "당첨되면 크다"는 기대감으로 이탈은 막으면서, 평균 지급원가는 낮게 통제하는 구조다.
+- **결제 관련 혜택은 그대로**: 위 감소/럭키박스 전환은 오직 **출석 보상**에만 적용된다. 배송비 할인, 충전 보너스(§7 `charge_bonus_rules`), PG 결제 조건 등 결제와 관련된 혜택·조건은 결제 이력과 무관하게 모든 유저에게 동일하게 적용한다 — 장기 무결제자를 다른 영역에서까지 차별하지 않는다.
+
+**설계 포인트 — 로열티 등급 & 코스메틱 (출석 보상과는 완전히 분리)**
+- `loyalty_tiers`는 순수하게 **누적 유상 충전액** 기준의 결제 등급 사다리(`basic → bronze → silver → gold → vip`)이며, 위 출석 보상의 증감 로직과는 무관하다.
+- **코스메틱은 등급 달성 시에만 자동 지급**: `cosmetic_items.min_tier_required` 등급에 도달하면 배치/트리거가 즉시 `user_cosmetic_unlocks`를 생성한다(`source=tier_achieved`) — 출석 체크인을 통한 코스메틱 지급 경로는 없다. 애니메이션(webp/gif) 프로필 장식처럼 원가 없는 "과시형" 보상을 결제 등급에만 묶어 결제 유도 효과를 낸다.
+- `user_profile_equipment`는 보유(`user_cosmetic_unlocks`) 중 실제 착용 중인 것만 가리킨다.
 - `user_cosmetic_unlocks`는 `(user_id, cosmetic_item_id)` UNIQUE로 중복 해금 방지(§13.3 참고).
 
 ---
@@ -990,7 +1012,7 @@ erDiagram
 - `free_draw_tickets`: `(user_id, status)` 부분 인덱스(`WHERE status='available'`), `expires_at` 만료 배치용.
 - `store_qr_issuances`: `qr_token` UNIQUE, `expires_at` 만료 배치용.
 - `store_checkins`: `qr_issuance_id` UNIQUE, `(user_id, created_at)` 복합 인덱스 — 일/주 한도 집계 및 이동거리 이상탐지용.
-- `attendance_calendar_configs`: `(tier_code, day_number)` UNIQUE.
+- `attendance_lucky_box_outcomes`: `policy_id` 인덱스, `SUM(probability) = 1.0`은 애플리케이션 레벨 검증(저장 전).
 - `user_cosmetic_unlocks`: `(user_id, cosmetic_item_id)` UNIQUE.
 
 ### 13.3 동시성 & 정합성 강제 요약
@@ -1012,5 +1034,6 @@ erDiagram
 | 위탁자 정산 이중 지급 방지 | `consignor_payouts`는 `available_balance` 범위 내에서만 생성, 지급 완료 후 `consignor_ledger_entries`에 `payout` 차감 기록 |
 | 동일 QR 토큰 재사용(리플레이) 방지 | `store_checkins.qr_issuance_id` UNIQUE, `store_qr_issuances.expires_at` 경과 토큰은 소비 불가 |
 | 무료 적립금 무한 채굴 방지 | 유상 충전 이력(`cumulative_charge_amount`) 없는 유저는 `cumulative_free_offline_bonus`가 `lifetime_free_cap_without_paid_charge` 도달 시 오프라인 체크인 보상 지급 중단 |
-| 장기 무료 이용자 출석 혜택 자동 감소 | `user_loyalty_status.free_tier_started_at` + `loyalty_tiers.max_free_days` 경과 시 배치가 `free_new → free_longterm`으로 강등(트리거/배치, 애플리케이션에서 임의 상향 금지) |
+| 장기 무결제자 출석 보상 감소가 결제 혜택까지 침범하지 않도록 격리 | `attendance_reward_policies`/`attendance_lucky_box_outcomes`는 `bonus_credit_grants`(§7)만 갱신, `loyalty_tiers.benefits`·`charge_bonus_rules`(결제 혜택)는 별도 경로로 절대 참조하지 않음 |
+| 럭키박스 확률 합계 오류 방지 | `attendance_lucky_box_outcomes` 저장 시 `SUM(probability) = 1.0` 애플리케이션 검증, 불일치 시 저장 거부 |
 | 코스메틱 중복 해금 방지 | `user_cosmetic_unlocks.(user_id, cosmetic_item_id)` UNIQUE |

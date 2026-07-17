@@ -486,8 +486,8 @@ GET /users/me/wallet
 
 | Method | Path | Auth | 설명 |
 |---|---|---|---|
-| POST | `/events/attendance/check-in` | Bearer | 당일 출석 체크 (1일 1회), 내 등급 전용 캘린더 순번 보상 지급 |
-| GET | `/events/attendance/status` | Bearer | 연속 출석 현황 + 내 등급 캘린더 진행도/미리보기 |
+| POST | `/events/attendance/check-in` | Bearer | 당일 출석 체크 (1일 1회), 활동 기반 동적 보상 지급 |
+| GET | `/events/attendance/status` | Bearer | 연속 출석 현황 + 다음 마일스톤까지 남은 일수 |
 | GET | `/missions` | Bearer | 진행 가능한 미션 목록과 내 진행도 |
 | POST | `/missions/{id}/claim` | Bearer | 완료된 미션 보상 수령 |
 | GET | `/users/me/loyalty` | Bearer | 내 로열티 등급, 누적 충전액, 다음 등급까지 남은 금액 |
@@ -502,32 +502,53 @@ GET /users/me/wallet
 
 **POST /events/attendance/check-in — 응답 예시**
 ```json
+// 평상시 (일반 동적 보상)
 {
-  "tier_code_at_checkin": "gold",
+  "attendance_day_number": 5,
   "streak_count": 5,
-  "calendar_day_number": 5,
-  "reward_type": "cosmetic_item",
-  "granted_cosmetic": { "id": 41, "code": "gold_frame_flame", "asset_format": "gif" },
+  "reward_source": "dynamic",
+  "reward_type": "bonus_credit",
+  "reward_value": 180,
   "wallet_balance_after": { "paid": 46500, "bonus": 2100 }
+}
+
+// 10일차 마일스톤
+{
+  "attendance_day_number": 10,
+  "streak_count": 10,
+  "reward_source": "milestone",
+  "reward_type": "free_draw_ticket",
+  "reward_value": 1,
+  "wallet_balance_after": { "paid": 46500, "bonus": 2100 }
+}
+
+// 장기 무결제자 — 확률형(럭키박스) 지급
+{
+  "attendance_day_number": 45,
+  "streak_count": 20,
+  "reward_source": "lucky_box",
+  "outcome_code": "small",
+  "reward_type": "bonus_credit",
+  "reward_value": 50,
+  "wallet_balance_after": { "paid": 0, "bonus": 1230 }
 }
 ```
 - 중복 체크인 시 `409 ALREADY_CHECKED_IN`.
-- **등급별로 다른 캘린더**(§ERD.md §8 `attendance_calendar_configs.tier_code`)가 적용된다 — 예를 들어 `free_new`의 5일차는 소량 적립금이지만, `gold`의 5일차는 애니메이션 프로필 장식일 수 있다. 캘린더는 체크인 시점의 등급을 스냅샷(`tier_code_at_checkin`)해 기록하므로, 이후 등급이 바뀌어도 과거 보상 이력은 그대로 남는다.
-- **장기 무료 이용자 자동 강등**: 가입(또는 최초 체크인) 후 `max_free_days`(기본 30일)가 지나도록 한 번도 충전하지 않으면 `free_new → free_longterm`으로 자동 전환되어 이후 출석 보상이 크게 줄어든다(`attendance_reward_multiplier` 하향). `GET /events/attendance/status` 응답에 남은 유예일수를 안내해 결제 유도.
+- **보상은 정적 캘린더가 아니라 매번 계산**된다 — 결제 이력(`last_charge_at`/`cumulative_charge_amount`), 연속 출석일수, 최근 이용도(뽑기·미션 완료 등)를 가중합한 점수로 `reward_value`가 산출된다(`attendance_reward_policies`, §ERD.md §8). 결제 없이 오래 이용할수록 `decay_window_days`에 걸쳐 서서히 줄지만(하루 변화폭이 작아 체감되지 않음), `milestone_days`(10·20일차 등)는 여전히 고가치 보상을 보장한다.
+- **코스메틱은 출석으로 지급되지 않는다** — 프로필 장식은 오직 결제 등급 달성 시에만 자동 해금된다(`GET /users/me/loyalty` 참고).
+- `long_term_free_threshold_days`를 넘긴 무결제 유저는 `reward_source=lucky_box`로 전환된다 — 대부분 소액(`outcome_code=small`)이지만 낮은 확률로 큰 보상(`jackpot`)이 나올 수 있어 산술적 기댓값 자체는 낮지 않다.
 
-**GET /events/attendance/status — 응답 예시 (free_new 유예기간 안내)**
+**GET /events/attendance/status — 응답 예시**
 ```json
 {
-  "tier_code": "free_new",
   "streak_count": 12,
-  "days_until_downgrade": 18,
-  "downgrade_warning": "18일 내 충전하지 않으면 출석 보상이 free_longterm 등급으로 축소됩니다.",
-  "calendar_preview": [
-    { "day_number": 13, "reward_type": "bonus_credit", "reward_value": 100 },
-    { "day_number": 14, "reward_type": "free_draw_ticket", "reward_value": 1 }
-  ]
+  "attendance_day_number": 12,
+  "next_milestone_day": 20,
+  "days_until_next_milestone": 8,
+  "reward_mode": "dynamic"
 }
 ```
+- 다음 보상 금액은 미리 노출하지 않는다(활동에 따라 매번 재계산되고, 장기 무결제자는 확률형으로 전환되므로 사전 고지가 오히려 "감소를 알아챈다"는 부작용을 만든다) — 다음 마일스톤까지 남은 일수만 안내해 참여를 유도.
 
 **GET /missions — 응답 예시**
 ```json
@@ -556,12 +577,11 @@ GET /users/me/wallet
     "remaining_amount": 1750000,
     "unlocks_preview": [ { "code": "vip_frame_holo", "item_type": "profile_frame", "asset_format": "gif" } ]
   },
-  "benefits": { "shipping_discount_rate": 0.5, "vip_only_packs": true },
-  "attendance_reward_multiplier": 2.0
+  "benefits": { "shipping_discount_rate": 0.5, "vip_only_packs": true }
 }
 ```
 - `cumulative_charge_amount`는 유상 충전액 기준(§ERD.md §7·§8) — 환불된 금액은 차감되어 등급이 강등될 수 있음.
-- 등급(`free_new`, `free_longterm`, `bronze`, `silver`, `gold`, `vip`)이 유상 충전 누적 기준으로 오를 때마다 그 등급 전용 코스메틱이 자동 해금된다 — `next_tier.unlocks_preview`로 "조금만 더 충전하면 이 장식을 받는다"를 보여줘 결제를 유도.
+- 등급(`basic`, `bronze`, `silver`, `gold`, `vip`)이 유상 충전 누적 기준으로 오를 때마다 그 등급 전용 코스메틱이 자동 해금된다 — `next_tier.unlocks_preview`로 "조금만 더 충전하면 이 장식을 받는다"를 보여줘 결제를 유도. 배송비 할인 등 결제 관련 혜택은 이 등급표로만 결정되며, 출석 여부·무결제 기간과는 무관하다.
 
 **GET /users/me/draw-tickets — 응답 예시**
 ```json
@@ -711,11 +731,12 @@ GET /users/me/wallet
 |---|---|---|
 | POST | `/admin/charge-bonus-rules` | 충전수단별 보너스 규칙 생성/수정 (계좌이체 유도용) |
 | PATCH | `/admin/charge-bonus-rules/{id}` | 규칙 활성화/비활성화, 요율 변경 |
-| POST | `/admin/attendance-calendar-configs` | 등급별 출석 캘린더 N일차 보상 구성 (`tier_code` 지정 필수) |
+| POST | `/admin/attendance-reward-policies` | 출석 동적 보상 정책 생성/수정 (가중치, 감소곡선, 마일스톤, 럭키박스 전환 기준) |
+| POST | `/admin/attendance-reward-policies/{id}/lucky-box-outcomes` | 장기 무결제자용 확률형 보상 테이블 등록 |
 | POST | `/admin/mission-definitions` | 미션 템플릿 생성 (트리거/보상 정의) |
 | PATCH | `/admin/mission-definitions/{id}` | 미션 활성화/비활성화, 보상 변경 |
-| POST | `/admin/loyalty-tiers` | 로열티 등급 생성/수정 (누적 충전 기준, 출석 보상 배율, free 등급 유예일수) |
-| POST | `/admin/cosmetic-items` | 코스메틱 아이템 등록 (webp/gif 애셋, 해금 등급 지정) |
+| POST | `/admin/loyalty-tiers` | 로열티 등급 생성/수정 (순수 누적 충전 기준) |
+| POST | `/admin/cosmetic-items` | 코스메틱 아이템 등록 (webp/gif 애셋, 해금 등급 지정 — 등급 달성 시에만 자동 지급) |
 | PATCH | `/admin/cosmetic-items/{id}` | 활성화/비활성화, 해금 등급 변경 |
 | POST | `/admin/draw-tickets/grant` | 특정 유저에게 무료 뽑기권 수동 지급 (CS 보상용) |
 
@@ -735,29 +756,40 @@ GET /users/me/wallet
 
 **POST /admin/loyalty-tiers — 요청 예시**
 ```json
-{
-  "tier_code": "free_longterm",
-  "tier_rank": 0,
-  "min_cumulative_charge": 0,
-  "max_free_days": null,
-  "attendance_reward_multiplier": 0.3,
-  "benefits": {}
-}
+{ "tier_code": "gold", "min_cumulative_charge": 1000000, "benefits": { "shipping_discount_rate": 0.5, "vip_only_packs": false } }
 ```
-- `free_new`(가입 초반 유예, `max_free_days`로 기간 지정) → `free_longterm`(무충전 장기이용자, 배율 하향) → `bronze/silver/gold/vip`(누적 충전 기준) 순으로 설계 — 무충전 유저의 출석 보상이 시간이 지날수록 줄어들어 자연스럽게 결제 전환을 유도한다.
+- `basic → bronze → silver → gold → vip` 순수 결제 등급 사다리. 출석 보상 증감과는 무관하며(§ERD.md §8), 코스메틱 해금 조건(`cosmetic_items.min_tier_required`)으로만 연결된다.
 
-**POST /admin/attendance-calendar-configs — 요청 예시**
+**POST /admin/attendance-reward-policies — 요청 예시**
 ```json
 {
-  "tier_code": "gold",
-  "day_number": 5,
-  "reward_type": "cosmetic_item",
-  "cosmetic_item_id": 41,
-  "description": "골드 등급 5일차: 애니메이션 프레임 지급",
+  "base_reward_amount": 50,
+  "payment_recency_weight": 1.5,
+  "streak_weight": 0.8,
+  "engagement_weight": 0.5,
+  "decay_start_days": 15,
+  "decay_window_days": 90,
+  "decay_floor_multiplier": 0.7,
+  "milestone_days": [7, 10, 20, 30, 50, 100],
+  "milestone_bonus_multiplier": 3.0,
+  "long_term_free_threshold_days": 60,
+  "long_term_free_lucky_box_enabled": true,
   "is_active": true
 }
 ```
-- 등급별로 완전히 다른 캘린더를 구성할 수 있어(같은 5일차라도 `free_new`는 적립금, `gold`는 코스메틱), "이중(다중) 출석부" 요구사항을 그대로 구현한다.
+- `decay_window_days`를 넉넉히(예: 90일) 잡을수록 일 단위 변화폭이 작아져 유저가 감소를 체감하기 어렵다 — 절벽형 강등 대신 완만한 곡선을 의도적으로 사용.
+
+**POST /admin/attendance-reward-policies/{id}/lucky-box-outcomes — 요청 예시**
+```json
+{
+  "outcomes": [
+    { "outcome_code": "small", "probability": 0.90, "reward_type": "bonus_credit", "reward_value": 50 },
+    { "outcome_code": "medium", "probability": 0.09, "reward_type": "bonus_credit", "reward_value": 500 },
+    { "outcome_code": "jackpot", "probability": 0.01, "reward_type": "free_draw_ticket", "reward_value": 1 }
+  ]
+}
+```
+- `probability` 합이 1.0이 아니면 `422 VALIDATION_ERROR` 반환. 기댓값(`Σ probability × reward_value` 환산)이 확정형 보상보다 높게 설계돼도, 90%는 `small`만 받으므로 실사용자 체감가치는 낮다 — "장기 무결제자에게는 덜 필요하지만 기댓값은 높은 보상"을 이 테이블로 구현한다.
 
 **POST /admin/cosmetic-items — 요청 예시**
 ```json
@@ -771,7 +803,7 @@ GET /users/me/wallet
   "is_active": true
 }
 ```
-- `min_tier_required_tier_code`로 등급을 지정하면 해당 등급 달성 시 배치가 전체 대상 유저에게 자동으로 `user_cosmetic_unlocks`를 생성한다.
+- `min_tier_required_tier_code`로 등급을 지정하면 해당 등급 달성 시 배치가 대상 유저에게 자동으로 `user_cosmetic_unlocks`를 생성한다 — 출석 체크인을 통한 지급 경로는 없다.
 
 ### 7.8 오프라인 매장 체크인 관리
 | Method | Path | 설명 |
