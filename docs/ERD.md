@@ -151,6 +151,7 @@ erDiagram
 - Refresh Token Rotation: 매 갱신 시 기존 토큰 `revoked_at` 세팅 후 신규 행 삽입. 탈취 감지를 위해 재사용 시도 시 해당 유저의 전체 세션 강제 만료.
 - 배송지는 컬럼 단위 암호화(AES-256, KMS). 인덱싱이 필요한 zipcode만 평문 유지.
 - `role`은 admin 전용 라우트 게이트에 사용, 세분화된 권한은 §9 `admin_permissions` 참고.
+- **회원 탈퇴(`status=withdrawn`) 처리 규칙**: (a) `wallets.paid_balance > 0`이면 탈퇴 전 §7 현금 환불(`payment_refunds`) 절차를 먼저 안내하고, 유저가 명시적으로 포기 동의한 잔액만 소멸 처리(동의 기록을 `user_change_logs`에 보존). (b) 미배송 `user_inventory`(`status=held`)가 있으면 배송 신청 또는 즉시환급 완료 전까지 탈퇴 차단. (c) 위탁자(`consignors`)로서 `settlement_holds.status=held`가 남아 있으면 정산 완료 전까지 탈퇴 차단. (d) 탈퇴 확정 시 개인정보(이메일·전화·주소·닉네임)는 즉시 비식별화(해시 대체)하되, 전자상거래법상 거래기록(결제·원장·뽑기 로그)은 5년 보존 — 로그의 `user_id` FK는 유지하고 식별 컬럼만 파기하는 가명처리 방식.
 - **SNS 계정은 `user_oauth_accounts`로 분리**(1:N) — 기존 `users.oauth_provider/oauth_id` 단일 컬럼 설계로는 한 유저가 카카오+네이버를 동시에 연결할 수 없어 확장. `UNIQUE(provider, provider_user_id)`로 동일 SNS 계정의 중복 유저 생성을 방지.
 - **계정 연결(Account Linking)**: SNS 최초 로그인 시 `email_from_provider`가 기존 `users.email`과 일치하고 `email_verified_by_provider = true`인 경우에만 자동 연결 제안. 그렇지 않으면 신규 계정으로 분리 생성(이메일 스푸핑 방지) — §API 명세 3.항 참고.
 - 이메일/전화번호 변경, 비밀번호 변경 등 민감 정보 수정은 `verification_codes`로 2단계 인증 후 확정하며, 성공 여부와 무관하게 `user_change_logs`에 감사 기록(본인 변경 포함 — 계정 탈취 대응 근거자료).
@@ -297,6 +298,8 @@ erDiagram
         numeric price_per_draw
         varchar status "draft, on_sale, sold_out, settled"
         boolean last_one_bonus_enabled
+        bigint last_one_bonus_physical_card_id FK "라스트원 상 실물(§4), enabled=true면 필수 — 슬롯과 별도로 사전 확보"
+        int max_draws_per_request "1회 요청 최대 연차 수, 예: 10 (다연차 뽑기 상한)"
         varchar server_seed_hash "SHA-256(server_seed), on_sale 전 공개(commit)"
         varchar server_seed "sold_out 후 공개(reveal), 그 전까지 NULL"
         timestamptz published_at
@@ -321,6 +324,7 @@ erDiagram
         bigint user_id FK
         bigint pack_id FK
         bigint slot_id FK UK
+        varchar draw_group_id "다연차 뽑기 묶음 UUID — 한 요청으로 N회 뽑으면 N행이 동일값 공유, 단건이면 단독값"
         varchar payment_method "points, free_ticket"
         numeric points_spent "payment_method=points일 때만"
         bigint free_draw_ticket_id FK "payment_method=free_ticket일 때만, §8 참조"
@@ -337,6 +341,8 @@ erDiagram
 4. `draw_logs`는 append-only(UPDATE/DELETE 금지, DB 권한으로 강제) 감사 로그.
 5. `payment_method=free_ticket`인 뽑기는 `free_draw_tickets.status`를 `used`로 전환하고 포인트 차감이 없다(§8 이벤트 보상 연동).
 6. `user_inventory` 생성과 같은 트랜잭션 안에서 `card_market_prices`의 그 시점 최신 시세를 `locked_reference_price`로 스냅샷한다(§6) — 즉시 시세 환급 금액이 이후 시세 변동과 무관하게 뽑힌 순간의 값으로 고정되도록 하는 지점이 바로 여기다.
+7. **다연차 뽑기**: 한 요청으로 최대 `max_draws_per_request`(예: 10)회를 뽑을 수 있다. 총액 잔액 검증 → N개 슬롯 소비 → N건의 `draw_logs`(동일 `draw_group_id`) 생성을 **전부 하나의 트랜잭션**으로 처리 — 부분 성공 없음(잔여 슬롯이 요청 수보다 적으면 전체 거부, `409 INSUFFICIENT_REMAINING_SLOTS`). 슬롯 선택은 단건과 동일하게 잔여 슬롯에서 `secrets` 기반 비복원 추출이므로 Provably Fair 검증 방식도 동일하다.
+8. **라스트원 상**: `last_one_bonus_enabled=true`인 팩의 **마지막 슬롯**을 소진한 뽑기 트랜잭션 안에서, `last_one_bonus_physical_card_id`의 실물을 같은 유저의 `user_inventory`에 추가로 삽입(`source=last_one_bonus`)하고 팩을 `sold_out`으로 전환한다 — 별도 배치가 아닌 동일 트랜잭션이라 "마지막 구 당첨자 판정" 경합이 존재하지 않는다. 라스트원 실물은 슬롯 밖에서 사전 확보(`physical_cards.status=allocated`)되어 커밋 해시에는 포함되지 않되 팩 상세에 공개된다.
 
 ---
 
@@ -358,7 +364,7 @@ erDiagram
         bigint id PK
         bigint user_id FK
         bigint physical_card_id FK UK
-        varchar source "draw, purchase, event, attendance_lucky_box"
+        varchar source "draw, purchase, event, attendance_lucky_box, last_one_bonus"
         bigint source_ref_id "draw_logs.id 등"
         varchar status "held, shipping_requested, shipped, delivered, confirmed, disputed, refunded"
         numeric locked_reference_price "획득(뽑기) 시점 card_market_prices 스냅샷 — 즉시환급 계산은 이 값만 사용, 이후 시세변동 미반영"
@@ -401,7 +407,7 @@ erDiagram
 
     REFUND_REQUESTS {
         bigint id PK
-        bigint user_inventory_id FK UK
+        bigint user_inventory_id FK "부분 UNIQUE: 활성 상태(pending/approved/paid)만 — rejected 후 재신청 허용"
         bigint user_id FK
         numeric refund_points
         varchar valuation_method "instant_market_price, manual_review"
@@ -449,6 +455,8 @@ erDiagram
     WALLETS ||--o{ BONUS_CREDIT_GRANTS : "accrues"
     USERS ||--o{ PAYMENT_TRANSACTIONS : makes
     PAYMENT_TRANSACTIONS ||--o| CHARGE_BONUS_RULES : "may apply"
+    PAYMENT_TRANSACTIONS ||--o{ PAYMENT_REFUNDS : "cancelled via"
+    USERS ||--o{ PAYMENT_REFUNDS : requests
 
     WALLETS {
         bigint id PK
@@ -501,12 +509,26 @@ erDiagram
         varchar sub_pg "nhn_kcp, kg_inicis, toss, kakaopay — 실제 라우팅된 하위 PG, API_SPEC.md §5.1 참고"
         varchar pg_tid UK
         numeric amount
+        numeric refunded_amount "누적 부분취소 합계, 기본 0 — amount 초과 불가"
         varchar method "card, transfer, kakaopay, naverpay"
-        varchar status "pending, approved, failed, cancelled"
+        varchar status "pending, approved, failed, cancelled, partially_refunded, refunded"
         bigint applied_bonus_rule_id FK
         jsonb webhook_payload
         timestamptz requested_at
         timestamptz approved_at
+    }
+
+    PAYMENT_REFUNDS {
+        bigint id PK
+        bigint user_id FK
+        bigint payment_transaction_id FK "취소 대상 원거래"
+        numeric refund_amount "이 거래에서 취소하는 금액 (부분취소 가능)"
+        numeric clawed_back_bonus "원거래에 딸려 지급됐던 충전 보너스 중 회수분"
+        varchar pg_refund_tid UK "PG 취소 거래번호 — 중복 취소 방지"
+        varchar status "requested, processing, completed, failed"
+        varchar idempotency_key UK
+        timestamptz requested_at
+        timestamptz completed_at
     }
 ```
 
@@ -518,6 +540,13 @@ erDiagram
 - **계좌이체 유도**: `charge_bonus_rules`에 `method=transfer` 규칙을 활성화하면, 계좌이체 충전 승인 시 `bonus_rate`만큼 `bonus_credit_grants`(`source_type=transfer_bonus`)가 자동 지급된다. 계좌이체 PG 수수료(약 1.8%)가 카드(3.4%+)보다 낮으므로(§API_SPEC §5.1), 절감분 일부를 즉시 무상 적립금으로 돌려주는 구조 — 환불 시에는 이 무상분은 회수되고 유상 충전액만 환불된다.
 - **소진 우선순위**: 뽑기(`draw_spend`) 시 `bonus_balance`를 먼저 차감(만료 임박한 `bonus_credit_grants`부터 FIFO)하고, 소진되면 `paid_balance`를 차감 — 유저 입장엔 무상 적립금이 먼저 없어지는 게 유리하고, 플랫폼 입장엔 환불 의무가 있는 유상 잔액을 최대한 보존할 수 있다.
 - `bonus_credit_grants.expires_at` 경과분은 배치가 `remaining_amount`를 0으로 만들며 `ledger_entries`에 `bonus_expired` 기록.
+
+**설계 포인트 — 유상 잔액 현금 환불(청약철회, `payment_refunds`)**
+- **환불 가능액 = 현재 `paid_balance`** (이미 뽑기에 소진된 금액은 환불 불가). 환불 요청이 오면 미취소 잔액이 남은 충전 건들 중 **최신 건부터 역순(LIFO)**으로 PG 부분취소를 배분한다 — 오래된 거래일수록 PG 취소 가능 기한(카드사 정책상 통상 수개월)을 넘겼을 확률이 높기 때문.
+- **보너스 회수(clawback)**: 취소되는 충전 건에 딸려 지급됐던 `charge_bonus_rules` 보너스(`bonus_credit_grants`)는 취소 비율만큼 회수한다. 이미 소진해서 회수할 무상 잔액이 부족하면 그 부족분을 환불액에서 차감(`clawed_back_bonus`) — "충전 보너스만 챙기고 원금은 환불"하는 어뷰징 차단.
+- 처리 순서(단일 트랜잭션 + PG 호출): `ledger_entries`에 `withdrawal`(-refund_amount, `balance_type=paid`) 선기록 → PG 취소 API 호출 → 성공 시 `payment_refunds.status=completed` / 실패 시 원장 역분개(보상 트랜잭션) 후 `failed`. `pg_refund_tid` UNIQUE + `idempotency_key`로 중복 취소 방지.
+- 계좌이체 충전 건 등 PG 취소가 불가한 결제수단은 지급대행 벤더(§API_SPEC §5.1)를 통한 계좌 환불로 폴백하며, 이 경우 처리 SLA가 다름을 유저에게 고지.
+- 관리자 대시보드에서 환불률·환불 사유를 모니터링(§API_SPEC §7.4) — 단기간 대량 충전 후 환불 반복은 §계획서 §5.2 이상거래 탐지 룰의 입력이 된다.
 
 ---
 
@@ -537,6 +566,12 @@ erDiagram
     USERS ||--|| USER_LOYALTY_STATUS : has
     LOYALTY_TIERS ||--o{ USER_LOYALTY_STATUS : "achieved by"
     USERS ||--o{ FREE_DRAW_TICKETS : holds
+    USERS ||--o{ WISHLISTS : keeps
+    CARDS ||--o{ WISHLISTS : "wished as"
+    USERS ||--o{ NOTIFICATIONS : receives
+    USERS ||--|| USER_NOTIFICATION_SETTINGS : configures
+    USERS ||--o{ USER_COLLECTION_ENTRIES : collects
+    CARDS ||--o{ USER_COLLECTION_ENTRIES : "recorded in"
     LOYALTY_TIERS ||--o{ COSMETIC_ITEMS : "unlocks at"
     USERS ||--o{ USER_COSMETIC_UNLOCKS : owns
     COSMETIC_ITEMS ||--o{ USER_COSMETIC_UNLOCKS : "unlocked as"
@@ -545,6 +580,7 @@ erDiagram
     ATTENDANCE_LOGS {
         bigint id PK
         bigint user_id FK
+        bigint policy_id FK "보상 계산에 사용된 attendance_reward_policies 버전 — 정책 변경 후에도 과거 지급 근거 재현 가능"
         date check_in_date UK "user_id+date 복합 UNIQUE"
         int streak_count
         int attendance_day_number "가입/최근 리셋 이후 누적 출석일수 — 마일스톤(10/20일차 등) 판정 기준"
@@ -704,6 +740,45 @@ erDiagram
         timestamptz used_at
         timestamptz created_at
     }
+
+    WISHLISTS {
+        bigint id PK
+        bigint user_id FK
+        bigint card_id FK "user_id+card_id 복합 UNIQUE"
+        boolean notify_on_pack_open "이 카드 포함 오리파 오픈 시 알림"
+        timestamptz created_at
+    }
+
+    NOTIFICATIONS {
+        bigint id PK
+        bigint user_id FK
+        varchar type "wishlist_pack_open, restock, shipping_update, settlement_released, dispute_resolved, marketing"
+        varchar title
+        text body
+        varchar deep_link "앱/웹 이동 경로"
+        varchar channel "in_app, push, email"
+        timestamptz read_at
+        timestamptz created_at
+    }
+
+    USER_NOTIFICATION_SETTINGS {
+        bigint id PK
+        bigint user_id FK UK
+        boolean push_enabled
+        boolean email_enabled
+        boolean marketing_opt_in "수신동의 — 정보통신망법상 명시적 동의 필수, 동의/철회 시각 기록"
+        timestamptz marketing_opt_in_at
+        timestamptz updated_at
+    }
+
+    USER_COLLECTION_ENTRIES {
+        bigint id PK
+        bigint user_id FK
+        bigint card_id FK "user_id+card_id 복합 UNIQUE — 도감 등록"
+        int acquired_count "누적 획득 횟수 (환급/배송과 무관하게 유지)"
+        timestamptz first_acquired_at
+        timestamptz created_at
+    }
 ```
 
 **설계 포인트**
@@ -711,6 +786,8 @@ erDiagram
 - `ranking_snapshots`는 실시간 집계 대신 주기적 배치 스냅샷(랭킹 조작·부하 방지), 실시간 뽑기 피드는 별도 WebSocket 채널(§API 명세 참고)로 처리하며 영속 저장하지 않음.
 - **미션 시스템**: `mission_definitions`는 관리자가 트리거 조건과 보상을 정의하는 템플릿, `user_missions`가 유저별 진행도를 추적. 뽑기/충전/친구초대 등 이벤트 발생 시 해당 유저의 `user_missions.progress_count`를 증가시키고 `target_count` 도달 시 `completed`로 전환(보상은 별도 청구 API로 명시적 수령 — 자동 지급하지 않아 "받았는지 모르고 방치" 방지 및 UX 상 보상 연출 여지 확보).
 - **무료 뽑기권**: `free_draw_tickets`는 출석/미션/쿠폰으로 지급되는 "뽑기 1회 무료" 아이템. `pack_scope`로 특정 게임/팩에만 쓰게 제한 가능. 뽑기 API(`POST /oripa-packs/{id}/draws`)가 `ticket_id`를 받으면 포인트 차감 대신 이 티켓을 소비 — 상세는 API_SPEC.md §3, §6 참고.
+- **위시리스트 & 알림**: 유저가 `wishlists`에 담은 카드가 신규 오리파 팩 슬롯에 포함되어 `on_sale` 전환되는 순간, 팩 발행 트랜잭션 후속 Celery 잡이 해당 카드를 위시한 유저 전원에게 `notifications`(`type=wishlist_pack_open`)를 생성하고 푸시 발송 — 원 계획서 §8 "위시리스트 & 재입고 알림". `user_notification_settings.marketing_opt_in`이 false인 유저에게는 `marketing` 타입만 차단하고 거래성 알림(배송/정산)은 항상 발송(정보통신망법상 광고성/거래성 정보 구분).
+- **컬렉션 도감**: 뽑기 확정 트랜잭션에서 `user_collection_entries`를 upsert(`acquired_count += 1`) — 카드를 환급·배송해도 도감 기록은 남는다(수집 이력이므로). 세트별 완성률(`도감 등록 수 / 세트 총 카드 수`)은 조회 시 계산하며, 완성 시 미션(`mission_definitions`) 트리거로 뱃지·보상 연계 가능 — 원 계획서 §7 "컬렉션 도감".
 
 **설계 포인트 — 활동 기반 동적 출석 보상 & "눈치채지 못하게" 줄어드는 무결제 보상**
 - 고정된 날짜별 보상 테이블 대신, 매 체크인마다 `attendance_reward_policies`의 가중치로 그 유저의 **결제 이력**(`last_charge_at`/`cumulative_charge_amount`), **연속 출석일수**(`streak_count`), **기타 이용도**(뽑기 횟수, 완료한 미션 수 등)를 합산한 `activity_score`를 계산해 보상을 그때그때 산출한다. `attendance_logs.activity_score_snapshot`에 계산근거를 남겨 재현·감사가 가능하다.
@@ -917,6 +994,7 @@ erDiagram
 4. **분쟁 시 처리**: 검수 기간 내 `delivery_disputes`가 열리면 보류 해제가 정지된다. 위탁자 귀책(그레이딩/사진과 실물 불일치 등)으로 판정되면 `settlement_holds.status=reversed` + `dispute_reversal` 기록으로 보류 취소, 구매자는 재배송/환급을 플랫폼 자체 재고 또는 별도 보상 재원으로 처리(위탁자에게 책임을 전가하되 구매자 피해를 위탁자 귀책 확정까지 기다리게 하지 않음).
 5. **출금**: `available_balance`가 쌓인 위탁자는 `consignor_payouts` 요청 → **플랫폼이 직접 계좌 이체하지 않고 지급대행 벤더(`pg_payout_ref`)를 경유** — 1순위는 세금계산서 자동발행까지 지원하는 포트원 파트너 정산 자동화, 위탁 거래량이 커지면 토스페이먼츠 지급대행(월 정액제)과 재비교(API_SPEC.md §5.1). 플랫폼이 임의 계좌로 직접 송금하면 전자금융거래법상 지급대행업 등록 이슈가 발생할 수 있어 반드시 라이선스가 있는 벤더를 경유.
 6. 개인 위탁자 대상 지급은 세법상 원천징수(예: 기타소득 3.3%) 대상일 가능성이 높아 `consignor_payouts.withholding_tax_amount`로 분리 계산 — 정확한 세율/신고 의무는 세무사 자문 필요.
+7. **위탁 철회(반환) 규칙**: 승인된 위탁 실물은 `physical_cards.status=in_stock`(팩 미배치) 상태에서만 위탁자가 철회·반환 요청 가능. 슬롯에 배치(`allocated`)된 뒤에는 커밋 해시에 포함되어 매핑 불변이므로 철회 불가 — 해당 팩이 `settled`될 때까지 기다렸다가 미뽑힘으로 남은 경우에만 반환된다(반환 배송비는 위탁자 부담). 이 규칙은 위탁 신청 약관에 명시.
 
 **법적 유의사항 (요약)**
 - 위탁 판매 자체가 중고/위탁물품 취급 관련 별도 신고·등록 대상인지 사업 개시 전 법률 검토 필요(§리스크, 오리지널 계획서 §10).
@@ -1052,6 +1130,12 @@ erDiagram
 - `user_cosmetic_unlocks`: `(user_id, cosmetic_item_id)` UNIQUE.
 - `card_market_prices`: `(card_id, fetched_at)` 복합 인덱스 — 최신 시세 조회 최적화.
 - `physical_cards`: `clearance_eligible` 부분 인덱스(`WHERE status='in_stock' AND clearance_eligible=true`) — 럭키박스 실물 보상 풀 스캔용.
+- `refund_requests`: `user_inventory_id` 부분 UNIQUE(`WHERE status IN ('pending','approved','paid')`) — 반려 후 재신청 허용하되 활성 요청은 1건만.
+- `payment_refunds`: `pg_refund_tid` UNIQUE, `idempotency_key` UNIQUE, `(payment_transaction_id, status)` 복합 인덱스.
+- `draw_logs`: `draw_group_id` 인덱스 — 다연차 묶음 조회용.
+- `wishlists`: `(user_id, card_id)` UNIQUE, `card_id` 인덱스(팩 오픈 시 역방향 알림 대상 조회).
+- `user_collection_entries`: `(user_id, card_id)` UNIQUE.
+- `notifications`: `(user_id, read_at)` 부분 인덱스(`WHERE read_at IS NULL`) — 미읽음 카운트 최적화.
 
 ### 13.3 동시성 & 정합성 강제 요약
 
@@ -1078,3 +1162,9 @@ erDiagram
 | 코스메틱 중복 해금 방지 | `user_cosmetic_unlocks.(user_id, cosmetic_item_id)` UNIQUE |
 | 신뢰할 수 없는 시세로 즉시 환급되는 것 방지 | 뽑기 확정 시점 `card_market_prices.fetched_at`이 `instant_exchange_policies.max_price_age_hours`를 초과하면 `user_inventory.locked_reference_price`를 NULL로 두어 이후 환급이 자동으로 `manual_review`로 전환되고, 즉시 지급(`status=paid`) 경로가 차단됨 |
 | 시세 변동 차익거래(뽑은 뒤 오른 가격으로 환급) 방지 | 즉시환급 계산은 항상 `user_inventory.locked_reference_price`(뽑기 확정 시점 스냅샷)만 사용, 환급 요청 시점에 `card_market_prices`를 재조회하지 않음(애플리케이션 레벨 — 조회 자체를 하지 않도록 구현) |
+| 현금 환불 과다 지급 방지 | `payment_refunds.refund_amount` 합계가 `paid_balance` 및 원거래별 `amount - refunded_amount`를 초과할 수 없음(트랜잭션 내 검증), `pg_refund_tid`/`idempotency_key` UNIQUE로 중복 취소 차단 |
+| 충전 보너스 먹튀(보너스만 소진 후 원금 환불) 방지 | 환불 시 해당 충전 건에 지급된 `bonus_credit_grants`를 비율대로 회수, 회수 불가분은 환불액에서 차감(`clawed_back_bonus`) |
+| 환급 재신청 시 중복 활성 요청 방지 | `refund_requests.user_inventory_id` 부분 UNIQUE(`WHERE status IN ('pending','approved','paid')`) |
+| 다연차 뽑기 부분 성공 방지 | N연차는 단일 트랜잭션 — 잔여 슬롯 부족 시 전체 롤백(`INSUFFICIENT_REMAINING_SLOTS`), 절대 일부만 커밋되지 않음 |
+| 라스트원 상 중복/경합 지급 방지 | 마지막 슬롯을 소진한 뽑기 트랜잭션 내에서만 지급 — 팩당 마지막 슬롯은 물리적으로 1개이므로 경합 자체가 불가능 |
+| 도감 중복 등록 방지 | `user_collection_entries.(user_id, card_id)` UNIQUE + upsert |

@@ -82,6 +82,7 @@
 | POST | `/users/me/phone-change/confirm` | Bearer | 인증 코드 검증 후 전화번호 변경 확정 |
 | POST | `/users/me/password` | Bearer + 현재 비밀번호 확인 | 비밀번호 변경 (전 세션 강제 로그아웃) |
 | GET | `/users/me/change-logs` | Bearer | 본인 정보 변경 이력 조회 |
+| DELETE | `/users/me` | Bearer + 비밀번호(또는 SNS 재인증) | 회원 탈퇴 — 잔액/미배송 카드/위탁 정산 보류가 남아 있으면 `409 WITHDRAWAL_BLOCKED`(사유 목록 반환), 해소 후 재시도. 확정 시 개인정보 즉시 가명처리, 거래기록은 법정 기간(5년) 보존(§ERD.md §2) |
 | GET | `/users/me/addresses` | Bearer | 배송지 목록 |
 | POST | `/users/me/addresses` | Bearer | 배송지 등록 |
 | PATCH | `/users/me/addresses/{id}` | Bearer | 배송지 수정 |
@@ -245,9 +246,9 @@ sequenceDiagram
 | GET | `/oripa-packs` | - | 판매중/예정 팩 목록 (`?game=&status=`) |
 | GET | `/oripa-packs/{id}` | - | 팩 상세 — 잔여 구수, **등급별 잔여 수량 실시간 공개**(투명성, §8) |
 | GET | `/oripa-packs/{id}/proof` | - | Provably Fair 증명 정보 (커밋 해시, sold_out 후 seed reveal) |
-| POST | `/oripa-packs/{id}/draws` | Bearer + Idempotency-Key | 1회 뽑기 실행 |
+| POST | `/oripa-packs/{id}/draws` | Bearer + Idempotency-Key | 뽑기 실행 — `draw_count`(기본 1, 최대 `max_draws_per_request`)로 다연차 지원 |
 | GET | `/oripa-packs/{id}/draws/{draw_id}` | Bearer | 특정 뽑기 결과 상세 |
-| GET | `/users/me/draws` | Bearer | 내 뽑기 이력 |
+| GET | `/users/me/draws` | Bearer | 내 뽑기 이력 (`?draw_group_id=`로 다연차 묶음 조회) |
 
 **GET /oripa-packs/{id} — 응답 예시 (투명성 핵심 필드)**
 ```json
@@ -259,7 +260,11 @@ sequenceDiagram
   "total_slots": 100,
   "remaining_slots": 37,
   "status": "on_sale",
-  "last_one_bonus_enabled": true,
+  "max_draws_per_request": 10,
+  "last_one_bonus": {
+    "enabled": true,
+    "prize_preview": { "card_name": "리자몽 ex SAR", "condition_grade": "PSA10", "images": ["https://cdn.../lastone.webp"] }
+  },
   "grade_summary": [
     { "grade": "SS", "total": 1, "remaining": 1 },
     { "grade": "S", "total": 5, "remaining": 2 },
@@ -293,38 +298,50 @@ sequenceDiagram
 ```
 
 ```json
-// Request — 포인트로 뽑기
+// Request — 포인트로 1회 뽑기
 POST /oripa-packs/42/draws
 Idempotency-Key: 7c1b6e2a-...
 { }
+
+// Request — 다연차(10연차) 뽑기
+POST /oripa-packs/42/draws
+Idempotency-Key: 3e8d0b5f-...
+{ "draw_count": 10 }
 
 // Request — 무료 뽑기권으로 뽑기 (§6 이벤트 보상으로 지급된 티켓)
 POST /oripa-packs/42/draws
 Idempotency-Key: 9a1f4c3d-...
 { "ticket_id": 5510 }
 
-// 200 Response
+// 200 Response (draw_count=1이든 N이든 동일 구조 — draws 배열)
 {
-  "draw_id": 991234,
-  "pack_id": 42,
-  "slot_no": 63,
-  "grade": "A",
-  "physical_card": {
-    "id": 88213,
-    "card_name": "피카츄 V",
-    "condition_grade": "S",
-    "is_graded": false,
-    "images": ["https://cdn.../photo1.webp"]
-  },
+  "draw_group_id": "b1f6c9e2-...",
+  "draws": [
+    {
+      "draw_id": 991234,
+      "slot_no": 63,
+      "grade": "A",
+      "physical_card": {
+        "id": 88213,
+        "card_name": "피카츄 V",
+        "condition_grade": "S",
+        "is_graded": false,
+        "images": ["https://cdn.../photo1.webp"]
+      },
+      "locked_reference_price": 45000
+    }
+  ],
+  "last_one_bonus_awarded": null,
   "payment_method": "points",
   "points_spent": 3000,
   "bonus_spent": 500,
   "wallet_balance_after": { "paid": 46500, "bonus": 0 },
-  "remaining_slots": 36,
-  "locked_reference_price": 45000
+  "remaining_slots": 36
 }
 ```
-- `ticket_id` 생략 시 포인트 차감(무상 적립금 우선 소진 후 유상 잔액, §ERD.md §7), `ticket_id` 지정 시 해당 `free_draw_tickets`를 소비하고 포인트 차감 없음(`payment_method: "free_ticket"`).
+- `ticket_id` 생략 시 포인트 차감(무상 적립금 우선 소진 후 유상 잔액, §ERD.md §7), `ticket_id` 지정 시 해당 `free_draw_tickets`를 소비하고 포인트 차감 없음(`payment_method: "free_ticket"`). 무료 뽑기권은 `draw_count=1`만 허용.
+- **다연차**: `draw_count`(최대 `max_draws_per_request`)만큼 단일 트랜잭션에서 슬롯을 비복원 추출 — 잔여 슬롯이 부족하면 부분 실행 없이 전체 거부(`409 INSUFFICIENT_REMAINING_SLOTS`). 응답의 `draws` 배열 순서가 실제 추출 순서다.
+- **라스트원 상**: 이 요청으로 팩의 마지막 슬롯이 소진되면 같은 트랜잭션에서 라스트원 실물이 함께 지급되며, 응답의 `last_one_bonus_awarded`에 해당 카드 정보가 담긴다(아니면 `null`).
 - `ticket_id`가 지정한 `pack_scope`와 대상 팩이 맞지 않으면 `422 TICKET_SCOPE_MISMATCH`, 이미 사용/만료된 티켓이면 `409 TICKET_NOT_AVAILABLE`.
 - 실패: `409 PACK_SOLD_OUT`, `402 INSUFFICIENT_BALANCE`, `423 PACK_LOCKED`(락 획득 실패, 재시도 유도).
 - `locked_reference_price`는 뽑힌 그 순간 `card_market_prices`에서 스냅샷된 값이다(시세 데이터가 없는 카드는 `null`). §4의 즉시 시세 환급은 이후 이 값이 오르든 내리든 **항상 이 스냅샷만** 사용하며, 요청 시점에 시세를 다시 조회하지 않는다 — "뽑고 나서 시세가 올랐다고 더 받는" 차익거래를 구조적으로 차단한다.
@@ -469,6 +486,9 @@ Idempotency-Key: 9a1f4c3d-...
 | GET | `/users/me/ledger` | Bearer | 포인트 증감 원장 이력 |
 | GET | `/users/me/bonus-credits` | Bearer | 보유 중인 무상 적립금 내역 (출처별, 만료일 포함) |
 | GET | `/charge-bonus-rules/active` | - | 현재 활성화된 충전 수단별 보너스 규칙 조회 (충전 화면 안내용) |
+| GET | `/users/me/wallet/refundable` | Bearer | 현금 환불 가능액 조회 (미사용 유상 잔액, 보너스 회수 예상액 포함) |
+| POST | `/wallet/refunds` | Bearer + Idempotency-Key | 유상 잔액 현금 환불(청약철회) 신청 — PG 결제취소 경유 |
+| GET | `/users/me/wallet/refunds/{id}` | Bearer | 환불 처리 상태 조회 |
 
 **GET /charge-bonus-rules/active — 응답 예시 (계좌이체 유도)**
 ```json
@@ -524,6 +544,30 @@ GET /users/me/wallet
 }
 ```
 
+**GET /users/me/wallet/refundable / POST /wallet/refunds — 현금 환불(청약철회)**
+```json
+// GET /users/me/wallet/refundable — 200 Response
+{
+  "paid_balance": 46500,
+  "refundable_amount": 46500,
+  "estimated_bonus_clawback": 1395,
+  "estimated_net_refund": 45105,
+  "refund_breakdown": [
+    { "payment_transaction_id": 33012, "method": "transfer", "cancellable_amount": 46500, "pg_cancellable": true }
+  ]
+}
+
+// POST /wallet/refunds — Request
+{ "refund_amount": 46500 }
+
+// 202 Response
+{ "id": 910, "status": "processing", "refund_amount": 46500, "clawed_back_bonus": 1395, "net_refund": 45105 }
+```
+- 환불 가능액은 **현재 유상 잔액**까지 — 이미 뽑기에 소진한 금액은 환불 불가. 원거래 배분은 최신 충전 건부터 역순(LIFO)으로 PG 부분취소한다(§ERD.md §7).
+- 취소되는 충전 건에 딸려 지급된 충전 보너스는 비율대로 회수되며, 이미 소진해 회수할 수 없는 부분은 환불액에서 차감(`clawed_back_bonus`) — 사전 견적을 `refundable` 조회로 투명하게 안내.
+- 실패: `422 REFUND_EXCEEDS_REFUNDABLE`(가능액 초과), `409 REFUND_ALREADY_IN_PROGRESS`(동일 유저의 처리중 환불 존재).
+- PG 취소가 불가한 결제수단/기한 경과 건은 지급대행 벤더 경유 계좌 환불로 폴백(처리 기간 상이함을 응답 `message`로 고지).
+
 ---
 
 ## 6. Event Service
@@ -545,6 +589,13 @@ GET /users/me/wallet
 | GET | `/rankings` | - | 랭킹 조회 (`?period=weekly`) |
 | POST | `/referrals/invite` | Bearer | 초대 코드 발급/조회 |
 | GET | `/events` | - | 진행중 이벤트(한정 오리파, 룰렛 등) 목록 |
+| GET | `/users/me/wishlist` | Bearer | 위시리스트 조회 |
+| POST | `/users/me/wishlist` | Bearer | 카드 위시 등록 (`notify_on_pack_open` 옵션) |
+| DELETE | `/users/me/wishlist/{card_id}` | Bearer | 위시 해제 |
+| GET | `/users/me/notifications` | Bearer | 알림 목록 (`?unread_only=true`) |
+| POST | `/users/me/notifications/{id}/read` | Bearer | 알림 읽음 처리 |
+| PATCH | `/users/me/notification-settings` | Bearer | 푸시/이메일/마케팅 수신 설정 변경 |
+| GET | `/users/me/collection` | Bearer | 컬렉션 도감 (`?game=&set=` — 세트별 완성률 포함) |
 
 **POST /events/attendance/check-in — 응답 예시**
 ```json
@@ -668,6 +719,35 @@ GET /users/me/wallet
 - 쿠폰 지급분은 `bonus_credit_grants`(`source_type=coupon`)로 적립되어 무상 적립금 취급(환불 대상 아님).
 - 실패: `404 COUPON_NOT_FOUND`, `409 COUPON_ALREADY_REDEEMED`, `410 COUPON_EXPIRED`.
 
+**POST /users/me/wishlist — 요청/응답 예시**
+```json
+// Request
+{ "card_id": 5821, "notify_on_pack_open": true }
+// 201 Response
+{ "card_id": 5821, "notify_on_pack_open": true }
+```
+- 위시한 카드가 포함된 오리파 팩이 `on_sale`로 전환되면 `notifications`(`type=wishlist_pack_open`) + 푸시가 발송된다(§ERD.md §8).
+
+**GET /users/me/collection — 응답 예시 (컬렉션 도감)**
+```json
+{
+  "game": "pokemon",
+  "sets": [
+    {
+      "set_code": "sv4a",
+      "set_name": "Shiny Treasure ex",
+      "total_cards": 190,
+      "collected_cards": 47,
+      "completion_rate": 0.247,
+      "entries": [
+        { "card_id": 5821, "card_name": "리자몽 ex", "acquired_count": 2, "first_acquired_at": "2026-06-01T00:00:00Z" }
+      ]
+    }
+  ]
+}
+```
+- 도감은 뽑기 확정 시 자동 등록되며, 카드를 환급·배송해도 기록은 유지된다(수집 이력). 세트 완성 시 미션 트리거로 뱃지/보상 연계 가능.
+
 ---
 
 ## 7. Admin Service
@@ -759,8 +839,10 @@ GET /users/me/wallet
 | PATCH | `/admin/users/{id}` | 관리자에 의한 유저 정보 강제 수정 (닉네임/이메일/전화번호/배송지) |
 | PATCH | `/admin/users/{id}/status` | 계정 정지/복구 |
 | GET | `/admin/users/{id}/change-logs` | 해당 유저의 전체 변경 이력(본인+관리자) 조회 |
-| GET | `/admin/refund-requests?status=pending` | 환급 신청 대기열 |
+| GET | `/admin/refund-requests?status=pending` | 환급(포인트 전환) 신청 대기열 — manual_review 건 |
 | POST | `/admin/refund-requests/{id}/approve` | 환급 승인 (ledger 반영) |
+| GET | `/admin/payment-refunds?status=failed` | 현금 환불(PG 취소) 처리 현황/실패 건 모니터링 |
+| POST | `/admin/payment-refunds/{id}/retry` | PG 취소 실패 건 재시도 또는 지급대행 폴백 전환 |
 | POST | `/admin/shipping-requests/{id}/ship` | 송장번호 등록, 배송 처리 |
 
 **PATCH /admin/users/{id} — 요청/응답 예시**
@@ -1120,3 +1202,7 @@ sequenceDiagram
 | 403 | `FREE_CREDIT_CAP_REACHED_REQUIRES_CHARGE` | 유상 충전 이력 없이 무료 적립금 누적 상한 도달 — 최소 1회 충전 필요 |
 | 403 | `COSMETIC_NOT_UNLOCKED` | 미해금 코스메틱 아이템 착용 시도 |
 | 422 | `LUCKY_BOX_EV_TOO_HIGH` | 럭키박스 확률 테이블의 기댓값이 `lucky_box_target_ev_ratio` 제약(baseline 미만)을 위반 |
+| 409 | `INSUFFICIENT_REMAINING_SLOTS` | 다연차 뽑기 요청 수가 잔여 슬롯보다 많음 (부분 실행 없이 전체 거부) |
+| 422 | `REFUND_EXCEEDS_REFUNDABLE` | 현금 환불 요청액이 환불 가능액(유상 잔액) 초과 |
+| 409 | `REFUND_ALREADY_IN_PROGRESS` | 처리중인 현금 환불 건이 이미 존재 |
+| 409 | `WITHDRAWAL_BLOCKED` | 잔액/미배송 카드/위탁 정산 보류 미해소 상태의 회원 탈퇴 시도 (사유 목록 포함 응답) |
