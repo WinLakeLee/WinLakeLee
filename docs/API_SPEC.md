@@ -1159,12 +1159,12 @@ sequenceDiagram
 
 | Method | Path | Auth | 설명 |
 |---|---|---|---|
-| GET | `/listings` | - | 리스팅 목록 (`?type=fixed_price\|bundle\|auction&auction_format=english\|dutch\|sealed&game=&status=active`) |
+| GET | `/listings` | - | 리스팅 목록 (`?type=fixed_price\|bundle\|auction&auction_format=english\|proxy\|dutch\|sealed&game=&status=active`) |
 | GET | `/listings/{id}` | - | 리스팅 상세 — 경매 형식별로 노출 필드가 다름(아래 참고) |
 | POST | `/listings/{id}/purchase` | Bearer + Idempotency-Key | 정가/번들 즉시 구매 (지갑 차감: bonus → exchange → paid) |
-| POST | `/listings/{id}/bids` | Bearer + Idempotency-Key | 경매 입찰 (english/sealed) — 입찰액만큼 지갑 홀드 |
+| POST | `/listings/{id}/bids` | Bearer + Idempotency-Key | 경매 입찰 (english/proxy/sealed) — 입찰액(proxy는 상한액)만큼 지갑 홀드 |
 | POST | `/listings/{id}/accept` | Bearer + Idempotency-Key | **네덜란드식 전용**: 현재 표시가에 즉시 낙찰 수락 |
-| GET | `/listings/{id}/bids` | - | 입찰 이력 — english: 공개(닉네임 마스킹) / sealed: 마감 전 본인 것만+입찰 수 / dutch: 해당 없음 |
+| GET | `/listings/{id}/bids` | - | 입찰 이력 — english: 공개(닉네임 마스킹) / proxy: 현재가 변동 이력만(상한 비공개) / sealed: 마감 전 본인 것만+입찰 수 / dutch: 해당 없음 |
 | POST | `/listings/{id}/buy-now` | Bearer + Idempotency-Key | 즉시구매가 결제로 경매 조기 종료 (english 전용) |
 | GET | `/users/me/bids` | Bearer | 내 입찰 현황 (`?status=active`) |
 | GET | `/users/me/listing-orders` | Bearer | 내 마켓 구매 이력 |
@@ -1196,6 +1196,9 @@ sequenceDiagram
 // english (공개 호가): 현재 최고가 공개
 { "auction": { "format": "english", "current_highest_bid": 72000, "min_next_bid": 73000, "bid_count": 14, "buy_now_price": 150000, "ends_at": "2026-07-20T21:00:00Z" } }
 
+// proxy (자동호가 비딩): 현재가는 공개하되 각자의 상한은 비공개
+{ "auction": { "format": "proxy", "current_price": 73000, "min_next_max": 74000, "bid_count": 14, "i_am_leading": false, "my_max_proxy_amount": 70000, "ends_at": "2026-07-20T21:00:00Z" } }
+
 // dutch (하락식): 현재가와 다음 하락 시각 공개 — 입찰 개념 없음
 { "auction": { "format": "dutch", "current_price": 84000, "next_drop_at": "2026-07-17T12:40:00Z", "next_price": 82000, "floor_price": 60000, "ends_at": "2026-07-20T21:00:00Z" } }
 
@@ -1221,10 +1224,24 @@ sequenceDiagram
 
 // 201 Response — sealed (타인 정보 일절 없음, 최고가 여부도 비공개)
 { "bid_id": 3302, "bid_amount": 72000, "status": "active", "held_amount": 72000, "replaced_previous_bid": true }
+
+// Request — proxy: 자동입찰 상한만 제출
+{ "max_proxy_amount": 90000 }
+
+// 201 Response — proxy: 상한을 걸자마자 시스템이 자동 호가한 결과
+{
+  "bid_id": 3303,
+  "max_proxy_amount": 90000,
+  "held_amount": 90000,
+  "i_am_leading": true,
+  "current_price": 74000,
+  "message": "90,000P까지 자동 입찰합니다. 현재가 74,000P로 선두입니다."
+}
 ```
-- 입찰 성공 시 입찰액이 지갑 홀드(`wallet_holds`)로 잠긴다 — 낙찰 후 미납이 구조적으로 불가능. english는 직전 최고 입찰자의 홀드가 즉시 해제되고, sealed 재입찰은 본인의 기존 입찰을 `replaced` 처리하며 홀드를 교체한다.
+- 입찰 성공 시 입찰액이 지갑 홀드(`wallet_holds`)로 잠긴다 — 낙찰 후 미납이 구조적으로 불가능. english는 직전 최고 입찰자의 홀드가 즉시 해제되고, sealed/proxy 재입찰(상한 상향)은 본인의 기존 입찰을 `replaced` 처리하며 홀드를 교체한다.
 - english: `현재 최고가 + min_bid_increment` 미만이면 `422 BID_TOO_LOW`, 마감 직전(`soft_close_extension_sec` 이내) 입찰이면 마감 연장(`extended: true`). sealed: 시작가 미만이면 `422 BID_TOO_LOW`(타인 최고가와는 비교 정보 자체를 주지 않음). 마감 후 입찰은 공통 `409 AUCTION_CLOSED`.
-- dutch 리스팅에 `/bids` 호출 시(또는 english/sealed에 `/accept` 호출 시) `409 AUCTION_FORMAT_MISMATCH`.
+- **proxy(자동호가)**: `max_proxy_amount`가 `현재가 + min_bid_increment` 미만이면 `422 BID_TOO_LOW`. 새 상한이 기존 최고 상한을 넘으면 리더가 교체되고 공개 현재가는 **기존 최고 상한 + 증분**으로, 못 넘으면 기존 리더가 자동 방어하며 현재가가 **새 상한 + 증분**으로 오른다(즉시 `outbid` 응답 — `i_am_leading: false`). 각자의 상한은 절대 공개되지 않으며, **낙찰가는 차상위 상한 + 증분**이라 선두라도 자기 상한 전액을 내는 일이 없다. 낙찰 시 최종가만 홀드에서 캡처하고 차액은 자동 해제.
+- dutch 리스팅에 `/bids` 호출 시(또는 english/proxy/sealed에 `/accept` 호출 시) `409 AUCTION_FORMAT_MISMATCH`.
 
 **POST /listings/{id}/accept — 네덜란드식 수락 예시**
 ```json
