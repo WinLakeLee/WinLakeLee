@@ -439,7 +439,7 @@ erDiagram
     BONUS_CREDIT_GRANTS {
         bigint id PK
         bigint wallet_id FK
-        varchar source_type "attendance, mission, transfer_bonus, coupon, season_pass, admin_grant"
+        varchar source_type "attendance, mission, transfer_bonus, coupon, admin_grant"
         bigint source_ref_id
         numeric amount
         numeric remaining_amount "소진 추적, 뽑기 시 무상 우선 차감(FIFO by expires_at)"
@@ -500,10 +500,6 @@ erDiagram
     MISSION_DEFINITIONS ||--o{ USER_MISSIONS : defines
     USERS ||--|| USER_LOYALTY_STATUS : has
     LOYALTY_TIERS ||--o{ USER_LOYALTY_STATUS : "achieved by"
-    USERS ||--o{ USER_SEASON_PASSES : owns
-    SEASON_PASSES ||--o{ USER_SEASON_PASSES : "played by"
-    SEASON_PASSES ||--o{ SEASON_PASS_REWARDS : defines
-    USER_SEASON_PASSES ||--o{ USER_SEASON_PASS_CLAIMS : claims
     USERS ||--o{ FREE_DRAW_TICKETS : holds
 
     ATTENDANCE_LOGS {
@@ -602,47 +598,10 @@ erDiagram
         timestamptz updated_at
     }
 
-    SEASON_PASSES {
-        bigint id PK
-        varchar name
-        date season_start
-        date season_end
-        numeric premium_price
-        int max_level
-        boolean is_active
-    }
-
-    SEASON_PASS_REWARDS {
-        bigint id PK
-        bigint season_pass_id FK
-        int level
-        varchar track "free, premium"
-        varchar reward_type "bonus_credit, free_draw_ticket"
-        numeric reward_value
-    }
-
-    USER_SEASON_PASSES {
-        bigint id PK
-        bigint user_id FK
-        bigint season_pass_id FK
-        int xp
-        int current_level
-        boolean premium_purchased
-        timestamptz purchased_at
-    }
-
-    USER_SEASON_PASS_CLAIMS {
-        bigint id PK
-        bigint user_season_pass_id FK
-        int level
-        varchar track "free, premium"
-        timestamptz claimed_at
-    }
-
     FREE_DRAW_TICKETS {
         bigint id PK
         bigint user_id FK
-        varchar source_type "attendance, mission, season_pass, coupon, admin_grant"
+        varchar source_type "attendance, mission, coupon, admin_grant"
         bigint source_ref_id
         varchar pack_scope "any, game:pokemon, pack:{id} — 사용 가능 범위"
         varchar status "available, used, expired"
@@ -656,9 +615,8 @@ erDiagram
 - `attendance_logs`는 `(user_id, check_in_date)` UNIQUE로 하루 중복 출석 방지, `streak_count`는 전일 미출석 시 배치/트리거로 리셋. `attendance_calendar_configs`로 관리자가 "N일차 보상"을 자유롭게 구성(예: 7일차 무료뽑기권, 30일차 대량 적립금).
 - `ranking_snapshots`는 실시간 집계 대신 주기적 배치 스냅샷(랭킹 조작·부하 방지), 실시간 뽑기 피드는 별도 WebSocket 채널(§API 명세 참고)로 처리하며 영속 저장하지 않음.
 - **미션 시스템**: `mission_definitions`는 관리자가 트리거 조건과 보상을 정의하는 템플릿, `user_missions`가 유저별 진행도를 추적. 뽑기/충전/친구초대 등 이벤트 발생 시 해당 유저의 `user_missions.progress_count`를 증가시키고 `target_count` 도달 시 `completed`로 전환(보상은 별도 청구 API로 명시적 수령 — 자동 지급하지 않아 "받았는지 모르고 방치" 방지 및 UX 상 보상 연출 여지 확보).
-- **시즌패스**: `season_pass_rewards`로 무료(free)/프리미엄(premium) 두 트랙 보상을 레벨별로 정의, `user_season_passes.xp`는 뽑기·충전·미션 완료 등으로 누적. 프리미엄 트랙은 `premium_purchased=true`인 유저만 청구 가능.
 - **로열티 등급(VIP)**: `loyalty_tiers.min_cumulative_charge` 기준으로 `user_loyalty_status.tier_id`가 배치/트리거로 자동 갱신 — 누적 충전액은 **유상 충전액 기준**(§7 `paid_balance` 흐름과 연동, 환불된 금액은 누적에서 차감)이라 무상 적립금으로 등급을 올릴 수 없다.
-- **무료 뽑기권**: `free_draw_tickets`는 출석/미션/시즌패스/쿠폰으로 지급되는 "뽑기 1회 무료" 아이템. `pack_scope`로 특정 게임/팩에만 쓰게 제한 가능. 뽑기 API(`POST /oripa-packs/{id}/draws`)가 `ticket_id`를 받으면 포인트 차감 대신 이 티켓을 소비 — 상세는 API_SPEC.md §3, §6 참고.
+- **무료 뽑기권**: `free_draw_tickets`는 출석/미션/쿠폰으로 지급되는 "뽑기 1회 무료" 아이템. `pack_scope`로 특정 게임/팩에만 쓰게 제한 가능. 뽑기 API(`POST /oripa-packs/{id}/draws`)가 `ticket_id`를 받으면 포인트 차감 대신 이 티켓을 소비 — 상세는 API_SPEC.md §3, §6 참고.
 
 ---
 

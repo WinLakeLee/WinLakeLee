@@ -481,7 +481,7 @@ GET /users/me/wallet
 
 ## 6. Event Service
 
-출석/미션/시즌패스/로열티 등급/추천인 등 리텐션 기능. 보상은 대부분 무상 적립금(`bonus_credit_grants`) 또는 무료 뽑기권(`free_draw_tickets`)으로 지급되며 §5/§7의 지갑 구조를 그대로 사용한다.
+출석/미션/로열티 등급/추천인 등 리텐션 기능. 보상은 대부분 무상 적립금(`bonus_credit_grants`) 또는 무료 뽑기권(`free_draw_tickets`)으로 지급되며 §5/§7의 지갑 구조를 그대로 사용한다.
 
 | Method | Path | Auth | 설명 |
 |---|---|---|---|
@@ -489,9 +489,6 @@ GET /users/me/wallet
 | GET | `/events/attendance/status` | Bearer | 연속 출석 현황 + 캘린더 진행도 |
 | GET | `/missions` | Bearer | 진행 가능한 미션 목록과 내 진행도 |
 | POST | `/missions/{id}/claim` | Bearer | 완료된 미션 보상 수령 |
-| GET | `/season-pass/current` | Bearer | 현재 시즌패스 진행 상태 (XP, 레벨, 트랙별 보상 수령 여부) |
-| POST | `/season-pass/premium/purchase` | Bearer + Idempotency-Key | 프리미엄 트랙 구매 (포인트 차감) |
-| POST | `/season-pass/rewards/{level}/claim` | Bearer | 레벨 보상 수령 (`?track=free\|premium`) |
 | GET | `/users/me/loyalty` | Bearer | 내 로열티 등급, 누적 충전액, 다음 등급까지 남은 금액 |
 | GET | `/users/me/draw-tickets` | Bearer | 보유 무료 뽑기권 목록 |
 | POST | `/coupons/redeem` | Bearer | 쿠폰 코드 등록 |
@@ -526,34 +523,6 @@ GET /users/me/wallet
 { "mission_id": 15, "status": "reward_claimed", "granted": { "type": "free_draw_ticket", "ticket_id": 5510, "expires_at": "2026-08-01T00:00:00Z" } }
 ```
 - 미완료 상태에서 청구 시 `409 MISSION_NOT_COMPLETED`, 이미 청구했으면 `409 REWARD_ALREADY_CLAIMED`.
-
-**GET /season-pass/current — 응답 예시**
-```json
-{
-  "season_pass_id": 3,
-  "name": "2026 서머 시즌패스",
-  "xp": 4200,
-  "current_level": 14,
-  "premium_purchased": false,
-  "next_level_xp": 4500,
-  "rewards_preview": [
-    { "level": 15, "track": "free", "reward_type": "bonus_credit", "reward_value": 200, "claimable": false },
-    { "level": 15, "track": "premium", "reward_type": "free_draw_ticket", "reward_value": 1, "claimable": false, "locked_reason": "premium_not_purchased" }
-  ]
-}
-```
-
-**POST /season-pass/premium/purchase — 요청/응답 예시**
-```json
-// Request
-{ }
-// 200 Response
-{ "premium_purchased": true, "amount_charged": 9900, "wallet_balance_after": { "paid": 36600, "bonus": 2100 } }
-```
-- 실패: `409 SEASON_PASS_ALREADY_PURCHASED`, `402 INSUFFICIENT_BALANCE`.
-
-**POST /season-pass/rewards/{level}/claim — 실패 케이스**
-- 프리미엄 트랙 미구매 상태에서 청구 시 `403 SEASON_PASS_PREMIUM_REQUIRED`, 아직 도달하지 않은 레벨이면 `409 LEVEL_NOT_REACHED`.
 
 **GET /users/me/loyalty — 응답 예시**
 ```json
@@ -694,8 +663,6 @@ GET /users/me/wallet
 | POST | `/admin/attendance-calendar-configs` | 출석 캘린더 N일차 보상 구성 |
 | POST | `/admin/mission-definitions` | 미션 템플릿 생성 (트리거/보상 정의) |
 | PATCH | `/admin/mission-definitions/{id}` | 미션 활성화/비활성화, 보상 변경 |
-| POST | `/admin/season-passes` | 시즌패스 생성 (시즌 기간, 프리미엄 가격, 최대 레벨) |
-| POST | `/admin/season-passes/{id}/rewards` | 레벨별 무료/프리미엄 트랙 보상 등록 |
 | POST | `/admin/loyalty-tiers` | 로열티 등급(누적 충전 기준) 생성/수정 |
 | POST | `/admin/draw-tickets/grant` | 특정 유저에게 무료 뽑기권 수동 지급 (CS 보상용) |
 
@@ -837,6 +804,3 @@ sequenceDiagram
 | 422 | `TICKET_SCOPE_MISMATCH` | 무료 뽑기권의 `pack_scope`와 대상 팩 불일치 |
 | 409 | `MISSION_NOT_COMPLETED` | 미완료 미션 보상 청구 시도 |
 | 409 | `REWARD_ALREADY_CLAIMED` | 이미 수령한 보상 재청구 시도 |
-| 409 | `SEASON_PASS_ALREADY_PURCHASED` | 이미 구매한 시즌패스 프리미엄 재구매 시도 |
-| 403 | `SEASON_PASS_PREMIUM_REQUIRED` | 프리미엄 미구매 상태에서 프리미엄 트랙 보상 청구 |
-| 409 | `LEVEL_NOT_REACHED` | 아직 도달하지 않은 시즌패스 레벨 보상 청구 |
