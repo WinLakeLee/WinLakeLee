@@ -1151,13 +1151,18 @@ erDiagram
     LISTING_AUCTIONS {
         bigint id PK
         bigint listing_id FK UK
-        numeric start_price
-        numeric buy_now_price "즉시구매가, nullable"
-        numeric min_bid_increment
+        varchar auction_format "english(공개 호가), dutch(하락가), sealed(블라인드)"
+        numeric start_price "english/sealed: 시작가·최저입찰가, dutch: 최초(최고) 표시가"
+        numeric buy_now_price "즉시구매가, english 전용, nullable"
+        numeric min_bid_increment "english 전용"
+        int soft_close_extension_sec "english 전용 — 마감 직전 입찰 시 연장 초(스나이핑 방지), 예: 120"
+        numeric dutch_decrement_amount "dutch 전용 — 1회 하락폭"
+        int dutch_decrement_interval_sec "dutch 전용 — 하락 주기, 예: 600(10분마다)"
+        numeric dutch_floor_price "dutch 전용 — 최저 한도가(도달 후 유지), 위탁품이면 위탁자 합의 최저가 이상"
+        varchar sealed_pricing_rule "sealed 전용 — first_price(내 입찰가 지불) 또는 second_price(차순위가+증분 지불, Vickrey)"
         timestamptz starts_at
         timestamptz ends_at
-        int soft_close_extension_sec "마감 직전 입찰 시 연장 초 — 스나이핑 방지, 예: 120"
-        bigint highest_bid_id FK "현재 최고 입찰, 파생 캐시"
+        bigint highest_bid_id FK "english 전용 파생 캐시 — sealed은 마감 전 최고가 개념을 노출하지 않음"
         varchar status "scheduled, live, ended, settled, cancelled"
     }
 
@@ -1165,9 +1170,9 @@ erDiagram
         bigint id PK
         bigint auction_id FK
         bigint user_id FK
-        numeric bid_amount
+        numeric bid_amount "sealed은 마감 전까지 본인 외 비공개(API 레벨 차단)"
         bigint wallet_hold_id FK "입찰액 홀드(§7 wallet_holds) — 잔액 없는 허수 입찰 차단"
-        varchar status "active, outbid, won, cancelled"
+        varchar status "active, outbid, replaced, won, lost, cancelled"
         timestamptz created_at
     }
 
@@ -1186,8 +1191,11 @@ erDiagram
 **설계 포인트**
 - **실물 잠금**: 리스팅이 `active`로 발행되면 포함된 `physical_cards`를 `status=allocated`로 전환(오리파 슬롯 배치와 동일 상태) — 같은 실물이 오리파 팩과 마켓 리스팅에 동시에 올라가는 것을 `listing_items.physical_card_id` UNIQUE + `oripa_slots.physical_card_id` UNIQUE + 상태머신으로 삼중 차단. `cancelled/expired` 시 `in_stock`으로 복귀.
 - **묶음(번들)**: `listing_items`에 N개 실물을 담으면 그대로 번들 — 구매 확정 시 N건의 `user_inventory`가 일괄 생성된다(`source=listing_purchase`).
-- **경매 진행**: 입찰은 `현재 최고가 + min_bid_increment` 이상만 허용. 입찰 성공 시 입찰액을 `wallet_holds`로 잠그고 직전 최고 입찰자의 홀드는 즉시 해제(`outbid`) — 잔액이 없는 허수 입찰과 낙찰 후 미납이 구조적으로 불가능하다. `ends_at` 직전 `soft_close_extension_sec` 이내 입찰이 들어오면 마감을 연장(스나이핑 방지).
-- **낙찰 정산**: 마감 배치가 최고 입찰을 `won` 처리 → 홀드를 `captured`로 전환(원장 차감) → `listing_orders`(`order_type=auction_won`) 생성 → 이후 배송/검수/확정 흐름은 §6과 동일. `buy_now_price` 즉시구매 시 경매를 조기 종료하고 동일 흐름.
+- **경매 3방식**(`auction_format`) — 재미와 가격발견 방식을 다양화:
+  - **english(공개 호가, 상승식)**: 입찰은 `현재 최고가 + min_bid_increment` 이상만 허용. 입찰 성공 시 입찰액을 `wallet_holds`로 잠그고 직전 최고 입찰자의 홀드는 즉시 해제(`outbid`). `ends_at` 직전 `soft_close_extension_sec` 이내 입찰이 들어오면 마감 연장(스나이핑 방지). `buy_now_price` 즉시구매로 조기 종료 가능.
+  - **dutch(네덜란드식, 하락식)**: `start_price`에서 시작해 `dutch_decrement_interval_sec`마다 `dutch_decrement_amount`씩 가격이 내려간다. **입찰 개념이 없고, 최초로 "수락(accept)"한 유저가 그 시점 가격에 즉시 낙찰** — 현재가는 `start_price - floor(경과시간/interval) × decrement`로 서버가 결정론적으로 계산하므로(별도 가격 갱신 배치 불필요) 클라이언트 표시가와 서버 계산가가 어긋날 수 없다. `dutch_floor_price` 도달 후엔 그 가격으로 유지되다가 `ends_at`에 유찰. 수락 경합은 경매별 Redis 락 + 리스팅 상태 전이로 1명만 성공. "기다리면 싸지지만 남이 먼저 채간다"는 긴장감이 재미 포인트.
+  - **sealed(블라인드, 봉인입찰)**: 진행 중에는 **입찰 금액이 전원 비공개**(본인 입찰만 조회 가능, 타인에겐 입찰 수만 노출). 유저당 활성 입찰 1건 — 재입찰 시 기존 입찰을 `replaced` 처리하고 홀드를 교체한다. 마감 시 최고가 낙찰(동액이면 선착순). `sealed_pricing_rule=second_price`(Vickrey)면 낙찰자가 **차순위 입찰가 + 증분**만 지불 — "솔직한 가치 입찰"을 유도해 눈치싸움 대신 진심가 경쟁이 되는 게임이론적 재미. 차액(입찰가-지불가)만큼의 홀드는 낙찰 확정 시 부분 해제.
+- **낙찰 정산(공통)**: 마감 배치(또는 dutch 수락/english 즉시구매 트랜잭션)가 승자 입찰을 `won`, 나머지를 `lost` 처리 → 승자 홀드를 `captured`로 전환(원장 차감, second_price는 지불액만 캡처하고 잔여 해제) → `listing_orders`(`order_type=auction_won`) 생성 → 이후 배송/검수/확정 흐름은 §6과 동일. 유찰 시 전원 홀드 해제 후 리스팅 `expired`.
 - **위탁 재고 판매 시 에스크로 재사용**: `seller_type=consignor` 리스팅이 판매되면 `settlement_holds`(`source_type=listing_order`)가 생성되어 §11과 동일하게 배송 확정 후 정산 — 오리파에서 뽑히든 마켓에서 팔리든 위탁자 보호 구조는 하나다.
 - 마켓 구매 결제도 §7 소진 우선순위(bonus → exchange → paid)를 따른다 — **환급 포인트(exchange)를 마켓 구매에 쓸 수 있게 함**으로써 "환급받은 가치를 플랫폼 안에서 소비"하는 선순환을 만들되 현금 인출은 계속 차단.
 
@@ -1252,7 +1260,7 @@ erDiagram
 - `user_collection_entries`: `(user_id, card_id)` UNIQUE.
 - `notifications`: `(user_id, read_at)` 부분 인덱스(`WHERE read_at IS NULL`) — 미읽음 카운트 최적화.
 - `listing_items`: `physical_card_id` UNIQUE — 동일 실물 이중 리스팅 차단.
-- `auction_bids`: `(auction_id, bid_amount DESC)` 복합 인덱스 — 최고가 조회, `wallet_hold_id` UNIQUE.
+- `auction_bids`: `(auction_id, bid_amount DESC)` 복합 인덱스 — 최고가 조회, `wallet_hold_id` UNIQUE, sealed 전용 `(auction_id, user_id)` 부분 UNIQUE(`WHERE status='active'`) — 유저당 활성 봉인입찰 1건.
 - `wallet_holds`: `(wallet_id, status)` 부분 인덱스(`WHERE status='held'`) — 사용가능잔액 계산.
 - `listing_auctions`: `(status, ends_at)` 부분 인덱스(`WHERE status='live'`) — 마감 배치 스캔.
 
@@ -1290,5 +1298,8 @@ erDiagram
 | 뽑기 환급 포인트의 현금 인출 차단(환금성 차단) | `refund_credit`은 `balance_type=exchange`로만 적립, `payment_refunds` 환불 가능액 계산은 `paid_balance`만 참조 — 애플리케이션·원장 이중 강제 |
 | 동일 실물의 오리파/마켓 이중 판매 방지 | `oripa_slots.physical_card_id` UNIQUE + `listing_items.physical_card_id` UNIQUE + `physical_cards.status` 상태머신(`in_stock→allocated`) 삼중 차단 |
 | 허수 입찰/낙찰 미납 방지 | 입찰 시 `wallet_holds`로 입찰액 선점(잔액 부족 시 입찰 자체 불가), 낙찰 시 `captured` 전환으로만 결제 |
-| 경매 동시 입찰 경합 | 경매별 Redis 락 + `bid_amount > 현재최고가 + min_bid_increment` 검증을 단일 트랜잭션에서 수행 |
+| 경매 동시 입찰 경합 | 경매별 Redis 락 + `bid_amount > 현재최고가 + min_bid_increment` 검증을 단일 트랜잭션에서 수행 (english) |
+| 네덜란드식 수락 경합(1물건 2낙찰) 방지 | 현재가는 경과시간 기반 결정론적 계산(가격 갱신 배치 없음), 수락은 경매별 Redis 락 + `store_listings.status` 상태 전이(`active→sold`)로 최초 1인만 성공 |
+| 블라인드 입찰 정보 유출 방지 | 마감 전 `auction_bids` 조회 API는 본인 입찰만 반환(타인에겐 입찰 수만), `highest_bid_id` 파생 캐시는 sealed에서 미사용 — 관리자 열람도 `audit_logs` 기록 |
+| 블라인드 중복 입찰 방지 | sealed 전용 `(auction_id, user_id)` 부분 UNIQUE — 재입찰은 기존 건 `replaced` + 홀드 교체로만 |
 | 개인의 오리파 발행 차단 | `oripa_packs.created_by`는 `admin_permissions` 보유 계정만 허용(애플리케이션 + DB 트리거 검증) — §13 법적 리스크 노트 |

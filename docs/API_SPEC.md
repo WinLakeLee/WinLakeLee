@@ -1159,12 +1159,13 @@ sequenceDiagram
 
 | Method | Path | Auth | 설명 |
 |---|---|---|---|
-| GET | `/listings` | - | 리스팅 목록 (`?type=fixed_price\|bundle\|auction&game=&status=active`) |
-| GET | `/listings/{id}` | - | 리스팅 상세 (포함 실물 카드들의 상태/그레이딩/사진, 경매면 현재가·마감시각) |
+| GET | `/listings` | - | 리스팅 목록 (`?type=fixed_price\|bundle\|auction&auction_format=english\|dutch\|sealed&game=&status=active`) |
+| GET | `/listings/{id}` | - | 리스팅 상세 — 경매 형식별로 노출 필드가 다름(아래 참고) |
 | POST | `/listings/{id}/purchase` | Bearer + Idempotency-Key | 정가/번들 즉시 구매 (지갑 차감: bonus → exchange → paid) |
-| POST | `/listings/{id}/bids` | Bearer + Idempotency-Key | 경매 입찰 — 입찰액만큼 지갑 홀드 |
-| GET | `/listings/{id}/bids` | - | 입찰 이력 (입찰자 닉네임 마스킹) |
-| POST | `/listings/{id}/buy-now` | Bearer + Idempotency-Key | 즉시구매가 결제로 경매 조기 종료 |
+| POST | `/listings/{id}/bids` | Bearer + Idempotency-Key | 경매 입찰 (english/sealed) — 입찰액만큼 지갑 홀드 |
+| POST | `/listings/{id}/accept` | Bearer + Idempotency-Key | **네덜란드식 전용**: 현재 표시가에 즉시 낙찰 수락 |
+| GET | `/listings/{id}/bids` | - | 입찰 이력 — english: 공개(닉네임 마스킹) / sealed: 마감 전 본인 것만+입찰 수 / dutch: 해당 없음 |
+| POST | `/listings/{id}/buy-now` | Bearer + Idempotency-Key | 즉시구매가 결제로 경매 조기 종료 (english 전용) |
 | GET | `/users/me/bids` | Bearer | 내 입찰 현황 (`?status=active`) |
 | GET | `/users/me/listing-orders` | Bearer | 내 마켓 구매 이력 |
 
@@ -1190,15 +1191,26 @@ sequenceDiagram
 - 위탁 리스팅이면 같은 트랜잭션에서 `settlement_holds`(`source_type=listing_order`)가 생성되어 §8 에스크로를 탄다.
 - 실패: `409 LISTING_NOT_ACTIVE`(이미 판매/취소됨), `402 INSUFFICIENT_BALANCE`.
 
-**POST /listings/{id}/bids — 요청/응답 예시**
+**GET /listings/{id} — 경매 형식별 노출 필드**
+```json
+// english (공개 호가): 현재 최고가 공개
+{ "auction": { "format": "english", "current_highest_bid": 72000, "min_next_bid": 73000, "bid_count": 14, "buy_now_price": 150000, "ends_at": "2026-07-20T21:00:00Z" } }
+
+// dutch (하락식): 현재가와 다음 하락 시각 공개 — 입찰 개념 없음
+{ "auction": { "format": "dutch", "current_price": 84000, "next_drop_at": "2026-07-17T12:40:00Z", "next_price": 82000, "floor_price": 60000, "ends_at": "2026-07-20T21:00:00Z" } }
+
+// sealed (블라인드): 금액 비공개 — 입찰 수와 내 입찰만
+{ "auction": { "format": "sealed", "pricing_rule": "second_price", "start_price": 50000, "bid_count": 9, "my_bid": { "bid_amount": 72000, "status": "active" }, "ends_at": "2026-07-20T21:00:00Z" } }
+```
+
+**POST /listings/{id}/bids — english/sealed 입찰 예시**
 ```json
 // Request
 { "bid_amount": 72000 }
 
-// 201 Response
+// 201 Response — english
 {
   "bid_id": 3301,
-  "auction_id": 88,
   "bid_amount": 72000,
   "status": "active",
   "held_amount": 72000,
@@ -1206,10 +1218,34 @@ sequenceDiagram
   "ends_at": "2026-07-20T21:00:00Z",
   "extended": false
 }
+
+// 201 Response — sealed (타인 정보 일절 없음, 최고가 여부도 비공개)
+{ "bid_id": 3302, "bid_amount": 72000, "status": "active", "held_amount": 72000, "replaced_previous_bid": true }
 ```
-- 입찰 성공 시 입찰액이 지갑 홀드(`wallet_holds`)로 잠기고, 직전 최고 입찰자의 홀드는 즉시 해제된다 — 낙찰 후 미납이 구조적으로 불가능.
-- `현재 최고가 + min_bid_increment` 미만이면 `422 BID_TOO_LOW`. 마감 후 입찰은 `409 AUCTION_CLOSED`. 마감 직전(`soft_close_extension_sec` 이내) 입찰이면 마감이 연장되고 응답의 `extended: true`로 안내.
-- 낙찰 처리(마감 배치): 최고 입찰 `won` → 홀드 `captured`(원장 차감) → `listing_orders`(`order_type=auction_won`) 생성 → WS/알림 통지. 유찰 시 모든 홀드 해제 후 리스팅 `expired`.
+- 입찰 성공 시 입찰액이 지갑 홀드(`wallet_holds`)로 잠긴다 — 낙찰 후 미납이 구조적으로 불가능. english는 직전 최고 입찰자의 홀드가 즉시 해제되고, sealed 재입찰은 본인의 기존 입찰을 `replaced` 처리하며 홀드를 교체한다.
+- english: `현재 최고가 + min_bid_increment` 미만이면 `422 BID_TOO_LOW`, 마감 직전(`soft_close_extension_sec` 이내) 입찰이면 마감 연장(`extended: true`). sealed: 시작가 미만이면 `422 BID_TOO_LOW`(타인 최고가와는 비교 정보 자체를 주지 않음). 마감 후 입찰은 공통 `409 AUCTION_CLOSED`.
+- dutch 리스팅에 `/bids` 호출 시(또는 english/sealed에 `/accept` 호출 시) `409 AUCTION_FORMAT_MISMATCH`.
+
+**POST /listings/{id}/accept — 네덜란드식 수락 예시**
+```json
+// Request — 클라이언트가 보고 있던 가격을 함께 제출(가격 하락 직후 오수락 방지)
+{ "expected_price": 84000 }
+
+// 200 Response — 즉시 낙찰
+{
+  "order_id": 7801,
+  "order_type": "auction_won",
+  "final_price": 84000,
+  "wallet_balance_after": { "paid": 12000, "exchange": 0, "bonus": 0 },
+  "message": "84,000P에 낙찰되었습니다."
+}
+```
+- 현재가는 `start_price - floor(경과시간/interval) × decrement`로 서버가 결정론적으로 계산(§ERD.md §13). `expected_price`가 서버 계산 현재가보다 **높으면** 그대로 현재가로 체결(유저에게 유리), 서버 현재가가 더 높아진 경우는 발생 불가(가격은 단조 하락). 이미 다른 유저가 수락했으면 `409 LISTING_NOT_ACTIVE`.
+- 수락 즉시 지갑 차감(홀드 없이 직접 결제) — 이후 흐름은 정가 구매와 동일.
+
+**낙찰 정산(공통)**
+- 마감 배치(english/sealed) 또는 수락 트랜잭션(dutch)이 승자를 `won`, 나머지를 `lost` 처리 → 승자 홀드 `captured`(원장 차감) → `listing_orders`(`order_type=auction_won`) 생성 → WS/알림 통지. 유찰 시 전원 홀드 해제 후 리스팅 `expired`.
+- **sealed + `second_price`(Vickrey)**: 낙찰자는 자기 입찰가가 아니라 **차순위 입찰가 + 최소증분**만 지불 — 홀드 중 지불액만 캡처하고 차액은 해제. 마감 후에야 전체 입찰 내역이 공개된다(`GET /listings/{id}/bids`가 마감 후부터 전체 반환). "진짜 생각하는 가치를 적어내는 게" 최적 전략이 되는 방식이라 눈치싸움 없는 색다른 재미를 준다.
 
 ### 10.1 관리자/위탁자 리스팅 관리
 
@@ -1293,4 +1329,5 @@ sequenceDiagram
 | 409 | `LISTING_NOT_ACTIVE` | 이미 판매/취소/만료된 리스팅 구매 시도 |
 | 422 | `BID_TOO_LOW` | 입찰액이 `현재 최고가 + min_bid_increment` 미만 |
 | 409 | `AUCTION_CLOSED` | 마감된 경매에 입찰 시도 |
+| 409 | `AUCTION_FORMAT_MISMATCH` | 경매 형식과 맞지 않는 엔드포인트 호출 (dutch에 입찰, english/sealed에 수락 등) |
 | 403 | `ORIPA_CREATION_FORBIDDEN` | 관리자가 아닌 계정(위탁자 포함)의 오리파 팩 생성 시도 — 개인 오리파 미지원(법적 리스크) |
