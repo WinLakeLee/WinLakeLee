@@ -486,12 +486,15 @@ GET /users/me/wallet
 
 | Method | Path | Auth | 설명 |
 |---|---|---|---|
-| POST | `/events/attendance/check-in` | Bearer | 당일 출석 체크 (1일 1회), 캘린더 순번 보상 지급 |
-| GET | `/events/attendance/status` | Bearer | 연속 출석 현황 + 캘린더 진행도 |
+| POST | `/events/attendance/check-in` | Bearer | 당일 출석 체크 (1일 1회), 내 등급 전용 캘린더 순번 보상 지급 |
+| GET | `/events/attendance/status` | Bearer | 연속 출석 현황 + 내 등급 캘린더 진행도/미리보기 |
 | GET | `/missions` | Bearer | 진행 가능한 미션 목록과 내 진행도 |
 | POST | `/missions/{id}/claim` | Bearer | 완료된 미션 보상 수령 |
 | GET | `/users/me/loyalty` | Bearer | 내 로열티 등급, 누적 충전액, 다음 등급까지 남은 금액 |
 | GET | `/users/me/draw-tickets` | Bearer | 보유 무료 뽑기권 목록 |
+| GET | `/cosmetics` | - | 전체 코스메틱 카탈로그 (등급별 해금 조건 포함) |
+| GET | `/users/me/cosmetics` | Bearer | 내가 보유(해금)한 코스메틱 목록 |
+| POST | `/users/me/profile/equip` | Bearer | 프레임/뱃지/애니메이션 장식 착용 변경 |
 | POST | `/coupons/redeem` | Bearer | 쿠폰 코드 등록 |
 | GET | `/rankings` | - | 랭킹 조회 (`?period=weekly`) |
 | POST | `/referrals/invite` | Bearer | 초대 코드 발급/조회 |
@@ -500,14 +503,31 @@ GET /users/me/wallet
 **POST /events/attendance/check-in — 응답 예시**
 ```json
 {
+  "tier_code_at_checkin": "gold",
   "streak_count": 5,
   "calendar_day_number": 5,
-  "reward_type": "bonus_credit",
-  "reward_value": 100,
+  "reward_type": "cosmetic_item",
+  "granted_cosmetic": { "id": 41, "code": "gold_frame_flame", "asset_format": "gif" },
   "wallet_balance_after": { "paid": 46500, "bonus": 2100 }
 }
 ```
-- 중복 체크인 시 `409 ALREADY_CHECKED_IN`. 캘린더 마지막 날(예: 7일차·30일차)은 `reward_type=free_draw_ticket`으로 무료 뽑기권을 지급하도록 관리자가 구성 가능(§ERD.md §8 `attendance_calendar_configs`).
+- 중복 체크인 시 `409 ALREADY_CHECKED_IN`.
+- **등급별로 다른 캘린더**(§ERD.md §8 `attendance_calendar_configs.tier_code`)가 적용된다 — 예를 들어 `free_new`의 5일차는 소량 적립금이지만, `gold`의 5일차는 애니메이션 프로필 장식일 수 있다. 캘린더는 체크인 시점의 등급을 스냅샷(`tier_code_at_checkin`)해 기록하므로, 이후 등급이 바뀌어도 과거 보상 이력은 그대로 남는다.
+- **장기 무료 이용자 자동 강등**: 가입(또는 최초 체크인) 후 `max_free_days`(기본 30일)가 지나도록 한 번도 충전하지 않으면 `free_new → free_longterm`으로 자동 전환되어 이후 출석 보상이 크게 줄어든다(`attendance_reward_multiplier` 하향). `GET /events/attendance/status` 응답에 남은 유예일수를 안내해 결제 유도.
+
+**GET /events/attendance/status — 응답 예시 (free_new 유예기간 안내)**
+```json
+{
+  "tier_code": "free_new",
+  "streak_count": 12,
+  "days_until_downgrade": 18,
+  "downgrade_warning": "18일 내 충전하지 않으면 출석 보상이 free_longterm 등급으로 축소됩니다.",
+  "calendar_preview": [
+    { "day_number": 13, "reward_type": "bonus_credit", "reward_value": 100 },
+    { "day_number": 14, "reward_type": "free_draw_ticket", "reward_value": 1 }
+  ]
+}
+```
 
 **GET /missions — 응답 예시**
 ```json
@@ -530,16 +550,46 @@ GET /users/me/wallet
 {
   "tier_code": "gold",
   "cumulative_charge_amount": 1250000,
-  "next_tier": { "tier_code": "vip", "min_cumulative_charge": 3000000, "remaining_amount": 1750000 },
-  "benefits": { "shipping_discount_rate": 0.5, "vip_only_packs": true }
+  "next_tier": {
+    "tier_code": "vip",
+    "min_cumulative_charge": 3000000,
+    "remaining_amount": 1750000,
+    "unlocks_preview": [ { "code": "vip_frame_holo", "item_type": "profile_frame", "asset_format": "gif" } ]
+  },
+  "benefits": { "shipping_discount_rate": 0.5, "vip_only_packs": true },
+  "attendance_reward_multiplier": 2.0
 }
 ```
 - `cumulative_charge_amount`는 유상 충전액 기준(§ERD.md §7·§8) — 환불된 금액은 차감되어 등급이 강등될 수 있음.
+- 등급(`free_new`, `free_longterm`, `bronze`, `silver`, `gold`, `vip`)이 유상 충전 누적 기준으로 오를 때마다 그 등급 전용 코스메틱이 자동 해금된다 — `next_tier.unlocks_preview`로 "조금만 더 충전하면 이 장식을 받는다"를 보여줘 결제를 유도.
 
 **GET /users/me/draw-tickets — 응답 예시**
 ```json
 { "data": [ { "id": 5510, "source_type": "mission", "pack_scope": "any", "status": "available", "expires_at": "2026-08-01T00:00:00Z" } ] }
 ```
+
+**GET /cosmetics — 응답 예시**
+```json
+{
+  "data": [
+    { "code": "gold_frame_flame", "item_type": "profile_frame", "asset_format": "gif", "min_tier_required": "gold" },
+    { "code": "vip_frame_holo", "item_type": "profile_frame", "asset_format": "gif", "min_tier_required": "vip" }
+  ]
+}
+```
+
+**GET /users/me/cosmetics / POST /users/me/profile/equip — 응답 예시**
+```json
+// GET /users/me/cosmetics
+{ "data": [ { "id": 41, "code": "gold_frame_flame", "item_type": "profile_frame", "unlocked_at": "2026-06-01T00:00:00Z", "source": "tier_achieved" } ] }
+
+// POST /users/me/profile/equip
+// Request
+{ "slot": "frame", "cosmetic_item_id": 41 }
+// 200 Response
+{ "equipped_frame_id": 41, "equipped_badge_id": null, "equipped_avatar_deco_id": null }
+```
+- 미보유 아이템 착용 시도 시 `403 COSMETIC_NOT_UNLOCKED`.
 
 **POST /coupons/redeem — 응답 예시**
 ```json
@@ -661,10 +711,12 @@ GET /users/me/wallet
 |---|---|---|
 | POST | `/admin/charge-bonus-rules` | 충전수단별 보너스 규칙 생성/수정 (계좌이체 유도용) |
 | PATCH | `/admin/charge-bonus-rules/{id}` | 규칙 활성화/비활성화, 요율 변경 |
-| POST | `/admin/attendance-calendar-configs` | 출석 캘린더 N일차 보상 구성 |
+| POST | `/admin/attendance-calendar-configs` | 등급별 출석 캘린더 N일차 보상 구성 (`tier_code` 지정 필수) |
 | POST | `/admin/mission-definitions` | 미션 템플릿 생성 (트리거/보상 정의) |
 | PATCH | `/admin/mission-definitions/{id}` | 미션 활성화/비활성화, 보상 변경 |
-| POST | `/admin/loyalty-tiers` | 로열티 등급(누적 충전 기준) 생성/수정 |
+| POST | `/admin/loyalty-tiers` | 로열티 등급 생성/수정 (누적 충전 기준, 출석 보상 배율, free 등급 유예일수) |
+| POST | `/admin/cosmetic-items` | 코스메틱 아이템 등록 (webp/gif 애셋, 해금 등급 지정) |
+| PATCH | `/admin/cosmetic-items/{id}` | 활성화/비활성화, 해금 등급 변경 |
 | POST | `/admin/draw-tickets/grant` | 특정 유저에게 무료 뽑기권 수동 지급 (CS 보상용) |
 
 **POST /admin/charge-bonus-rules — 요청 예시**
@@ -680,6 +732,46 @@ GET /users/me/wallet
 }
 ```
 - 카드 결제 대비 계좌이체의 PG 수수료 절감분(§5.1)을 재원으로 하므로, `bonus_rate`는 절감폭 이내로 설정해 마진을 해치지 않도록 관리자가 직접 통제한다.
+
+**POST /admin/loyalty-tiers — 요청 예시**
+```json
+{
+  "tier_code": "free_longterm",
+  "tier_rank": 0,
+  "min_cumulative_charge": 0,
+  "max_free_days": null,
+  "attendance_reward_multiplier": 0.3,
+  "benefits": {}
+}
+```
+- `free_new`(가입 초반 유예, `max_free_days`로 기간 지정) → `free_longterm`(무충전 장기이용자, 배율 하향) → `bronze/silver/gold/vip`(누적 충전 기준) 순으로 설계 — 무충전 유저의 출석 보상이 시간이 지날수록 줄어들어 자연스럽게 결제 전환을 유도한다.
+
+**POST /admin/attendance-calendar-configs — 요청 예시**
+```json
+{
+  "tier_code": "gold",
+  "day_number": 5,
+  "reward_type": "cosmetic_item",
+  "cosmetic_item_id": 41,
+  "description": "골드 등급 5일차: 애니메이션 프레임 지급",
+  "is_active": true
+}
+```
+- 등급별로 완전히 다른 캘린더를 구성할 수 있어(같은 5일차라도 `free_new`는 적립금, `gold`는 코스메틱), "이중(다중) 출석부" 요구사항을 그대로 구현한다.
+
+**POST /admin/cosmetic-items — 요청 예시**
+```json
+{
+  "code": "vip_frame_holo",
+  "name": "VIP 홀로그램 프레임",
+  "item_type": "profile_frame",
+  "asset_format": "gif",
+  "asset_url": "https://cdn.../vip_frame_holo.gif",
+  "min_tier_required_tier_code": "vip",
+  "is_active": true
+}
+```
+- `min_tier_required_tier_code`로 등급을 지정하면 해당 등급 달성 시 배치가 전체 대상 유저에게 자동으로 `user_cosmetic_unlocks`를 생성한다.
 
 ### 7.8 오프라인 매장 체크인 관리
 | Method | Path | 설명 |
@@ -925,3 +1017,4 @@ sequenceDiagram
 | 403 | `DEVICE_INTEGRITY_FAILED` | 디바이스 무결성 증명(Play Integrity/DeviceCheck) 검증 실패 |
 | 429 | `DAILY_CHECKIN_LIMIT_REACHED` / `WEEKLY_CHECKIN_LIMIT_REACHED` | 오프라인 체크인 일/주 한도 초과 |
 | 403 | `FREE_CREDIT_CAP_REACHED_REQUIRES_CHARGE` | 유상 충전 이력 없이 무료 적립금 누적 상한 도달 — 최소 1회 충전 필요 |
+| 403 | `COSMETIC_NOT_UNLOCKED` | 미해금 코스메틱 아이템 착용 시도 |

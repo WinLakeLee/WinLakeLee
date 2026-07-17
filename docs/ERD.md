@@ -501,7 +501,12 @@ erDiagram
     MISSION_DEFINITIONS ||--o{ USER_MISSIONS : defines
     USERS ||--|| USER_LOYALTY_STATUS : has
     LOYALTY_TIERS ||--o{ USER_LOYALTY_STATUS : "achieved by"
+    LOYALTY_TIERS ||--o{ ATTENDANCE_CALENDAR_CONFIGS : "scopes"
     USERS ||--o{ FREE_DRAW_TICKETS : holds
+    LOYALTY_TIERS ||--o{ COSMETIC_ITEMS : "unlocks at"
+    USERS ||--o{ USER_COSMETIC_UNLOCKS : owns
+    COSMETIC_ITEMS ||--o{ USER_COSMETIC_UNLOCKS : "unlocked as"
+    USERS ||--|| USER_PROFILE_EQUIPMENT : has
 
     ATTENDANCE_LOGS {
         bigint id PK
@@ -509,15 +514,18 @@ erDiagram
         date check_in_date UK "user_id+date 복합 UNIQUE"
         int streak_count
         int calendar_day_number "캘린더 순환 몇 일차 보상을 받았는지"
+        varchar tier_code_at_checkin "체크인 시점에 적용된 등급 코드 스냅샷(감사/분석용)"
         numeric reward_points
         timestamptz created_at
     }
 
     ATTENDANCE_CALENDAR_CONFIGS {
         bigint id PK
+        varchar tier_code "이 캘린더가 적용되는 등급 — §8 '이중 출석부'의 실체, LOYALTY_TIERS.tier_code 참조"
         int day_number "1~N, 연속출석 순환 주기 내 순번"
-        varchar reward_type "bonus_credit, free_draw_ticket"
-        numeric reward_value
+        varchar reward_type "bonus_credit, free_draw_ticket, cosmetic_item"
+        numeric reward_value "reward_type=cosmetic_item일 땐 NULL"
+        bigint cosmetic_item_id FK "reward_type=cosmetic_item일 때만"
         varchar description
         boolean is_active
     }
@@ -585,8 +593,11 @@ erDiagram
 
     LOYALTY_TIERS {
         bigint id PK
-        varchar tier_code "bronze, silver, gold, vip"
-        numeric min_cumulative_charge "누적 유상 충전액 기준"
+        varchar tier_code UK "free_new, free_longterm, bronze, silver, gold, vip"
+        int tier_rank "정렬/승급 판정용 순서, free_longterm은 free_new보다 낮은 혜택이지만 rank는 동일 그룹"
+        numeric min_cumulative_charge "누적 유상 충전액 기준, free 계열은 0"
+        int max_free_days "free_new 전용 — 가입/최초체크인 후 이 일수가 지나도 무충전이면 free_longterm으로 자동 강등"
+        numeric attendance_reward_multiplier "해당 등급 출석 보상 배율, 예: free_longterm=0.3, gold=2.0"
         jsonb benefits "배송비 할인율, 전용 이벤트, 등급전용 팩 접근 등"
     }
 
@@ -596,7 +607,38 @@ erDiagram
         bigint tier_id FK
         numeric cumulative_charge_amount "누적 유상 충전액"
         numeric cumulative_free_offline_bonus "오프라인 체크인으로 받은 무상 적립금 누적, §12 채굴방지 규칙에 사용"
+        date free_tier_started_at "free_new 진입일 — max_free_days 경과 판정 기준"
         timestamptz tier_achieved_at
+        timestamptz updated_at
+    }
+
+    COSMETIC_ITEMS {
+        bigint id PK
+        varchar code UK
+        varchar name
+        varchar item_type "profile_frame, profile_badge, animated_deco"
+        varchar asset_format "webp, gif, png"
+        varchar asset_url
+        bigint min_tier_required FK "이 등급 이상 달성 시 자동 unlock, nullable(이벤트 전용 아이템)"
+        boolean is_active
+        timestamptz created_at
+    }
+
+    USER_COSMETIC_UNLOCKS {
+        bigint id PK
+        bigint user_id FK
+        bigint cosmetic_item_id FK
+        varchar source "tier_achieved, attendance_calendar, event, admin_grant"
+        bigint source_ref_id
+        timestamptz unlocked_at
+    }
+
+    USER_PROFILE_EQUIPMENT {
+        bigint id PK
+        bigint user_id FK UK
+        bigint equipped_frame_id FK "COSMETIC_ITEMS 참조, nullable"
+        bigint equipped_badge_id FK "nullable"
+        bigint equipped_avatar_deco_id FK "nullable"
         timestamptz updated_at
     }
 
@@ -614,11 +656,17 @@ erDiagram
 ```
 
 **설계 포인트**
-- `attendance_logs`는 `(user_id, check_in_date)` UNIQUE로 하루 중복 출석 방지, `streak_count`는 전일 미출석 시 배치/트리거로 리셋. `attendance_calendar_configs`로 관리자가 "N일차 보상"을 자유롭게 구성(예: 7일차 무료뽑기권, 30일차 대량 적립금).
+- `attendance_logs`는 `(user_id, check_in_date)` UNIQUE로 하루 중복 출석 방지, `streak_count`는 전일 미출석 시 배치/트리거로 리셋.
 - `ranking_snapshots`는 실시간 집계 대신 주기적 배치 스냅샷(랭킹 조작·부하 방지), 실시간 뽑기 피드는 별도 WebSocket 채널(§API 명세 참고)로 처리하며 영속 저장하지 않음.
 - **미션 시스템**: `mission_definitions`는 관리자가 트리거 조건과 보상을 정의하는 템플릿, `user_missions`가 유저별 진행도를 추적. 뽑기/충전/친구초대 등 이벤트 발생 시 해당 유저의 `user_missions.progress_count`를 증가시키고 `target_count` 도달 시 `completed`로 전환(보상은 별도 청구 API로 명시적 수령 — 자동 지급하지 않아 "받았는지 모르고 방치" 방지 및 UX 상 보상 연출 여지 확보).
-- **로열티 등급(VIP)**: `loyalty_tiers.min_cumulative_charge` 기준으로 `user_loyalty_status.tier_id`가 배치/트리거로 자동 갱신 — 누적 충전액은 **유상 충전액 기준**(§7 `paid_balance` 흐름과 연동, 환불된 금액은 누적에서 차감)이라 무상 적립금으로 등급을 올릴 수 없다.
 - **무료 뽑기권**: `free_draw_tickets`는 출석/미션/쿠폰으로 지급되는 "뽑기 1회 무료" 아이템. `pack_scope`로 특정 게임/팩에만 쓰게 제한 가능. 뽑기 API(`POST /oripa-packs/{id}/draws`)가 `ticket_id`를 받으면 포인트 차감 대신 이 티켓을 소비 — 상세는 API_SPEC.md §3, §6 참고.
+
+**설계 포인트 — 결제금액별 "이중 출석부" & 유료 전환 유도**
+- **등급별 출석부 분리**: `attendance_calendar_configs.tier_code`로 등급마다 완전히 다른 캘린더를 구성한다 — 동일한 날짜(`day_number`)라도 `free_new`는 소량 적립금, `gold`/`vip`는 무료뽑기권이나 코스메틱 아이템(`reward_type=cosmetic_item`)을 받도록 설계 가능. `attendance_logs.tier_code_at_checkin`은 체크인 당시 어느 캘린더가 적용됐는지 스냅샷으로 남긴다.
+- **가입 초반 유인 → 장기 무료 이용자 혜택 감소**: `loyalty_tiers.max_free_days`(예: 30일)를 `free_new` 등급에만 설정 — `user_loyalty_status.free_tier_started_at`으로부터 이 기간이 지났는데도 `cumulative_charge_amount = 0`이면 배치가 자동으로 `free_longterm` 등급(`attendance_reward_multiplier`가 훨씬 낮음, 예: 0.3)으로 강등한다. 신규 유저에게는 넉넉한 출석 보상으로 습관을 들이게 하되, 결제 없이 장기간 무료로만 버티는 유저는 자연스럽게 보상이 줄어들어 유료 전환 압박이 생긴다.
+- **결제 등급 = 코스메틱 해금**: `loyalty_tiers`가 승급(`min_cumulative_charge` 도달)하면 `cosmetic_items.min_tier_required`가 그 등급 이하인 항목들이 배치/트리거로 `user_cosmetic_unlocks`에 자동 지급된다. 정적 이미지뿐 아니라 `asset_format=webp/gif`인 애니메이션 프로필 장식(`item_type=animated_deco`)을 등급 전용으로 제공 — 실물/포인트 보상이 아닌 "과시형" 보상이라 원가 부담 없이 결제 유도 효과를 낼 수 있다.
+- `user_profile_equipment`는 유저가 보유한(`user_cosmetic_unlocks`) 항목 중 실제로 착용 중인 것만 가리킨다 — 소유와 착용을 분리해 다회선택형 코스메틱 확장에 대비.
+- `user_cosmetic_unlocks`는 `(user_id, cosmetic_item_id)` UNIQUE로 중복 해금 방지(§13.3 참고).
 
 ---
 
@@ -942,6 +990,8 @@ erDiagram
 - `free_draw_tickets`: `(user_id, status)` 부분 인덱스(`WHERE status='available'`), `expires_at` 만료 배치용.
 - `store_qr_issuances`: `qr_token` UNIQUE, `expires_at` 만료 배치용.
 - `store_checkins`: `qr_issuance_id` UNIQUE, `(user_id, created_at)` 복합 인덱스 — 일/주 한도 집계 및 이동거리 이상탐지용.
+- `attendance_calendar_configs`: `(tier_code, day_number)` UNIQUE.
+- `user_cosmetic_unlocks`: `(user_id, cosmetic_item_id)` UNIQUE.
 
 ### 13.3 동시성 & 정합성 강제 요약
 
@@ -962,3 +1012,5 @@ erDiagram
 | 위탁자 정산 이중 지급 방지 | `consignor_payouts`는 `available_balance` 범위 내에서만 생성, 지급 완료 후 `consignor_ledger_entries`에 `payout` 차감 기록 |
 | 동일 QR 토큰 재사용(리플레이) 방지 | `store_checkins.qr_issuance_id` UNIQUE, `store_qr_issuances.expires_at` 경과 토큰은 소비 불가 |
 | 무료 적립금 무한 채굴 방지 | 유상 충전 이력(`cumulative_charge_amount`) 없는 유저는 `cumulative_free_offline_bonus`가 `lifetime_free_cap_without_paid_charge` 도달 시 오프라인 체크인 보상 지급 중단 |
+| 장기 무료 이용자 출석 혜택 자동 감소 | `user_loyalty_status.free_tier_started_at` + `loyalty_tiers.max_free_days` 경과 시 배치가 `free_new → free_longterm`으로 강등(트리거/배치, 애플리케이션에서 임의 상향 금지) |
+| 코스메틱 중복 해금 방지 | `user_cosmetic_unlocks.(user_id, cosmetic_item_id)` UNIQUE |
