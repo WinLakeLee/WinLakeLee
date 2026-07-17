@@ -19,7 +19,8 @@ GENERATED ALWAYS AS IDENTITY PK`, `created_at timestamptz DEFAULT now()`를 공�
 10. [Card Data Collection Pipeline (운영 데이터 수집)](#10-card-data-collection-pipeline-운영-데이터-수집)
 11. [Consignment & Marketplace Escrow (위탁 판매 & 정산 에스크로)](#11-consignment--marketplace-escrow-위탁-판매--정산-에스크로)
 12. [Offline Store Check-in & Anti-Farming (오프라인 매장 체크인 & 채굴 방지)](#12-offline-store-check-in--anti-farming-오프라인-매장-체크인--채굴-방지)
-13. [설계 노트](#13-설계-노트)
+13. [Marketplace — 단품/묶음 판매 & 경매](#13-marketplace--단품묶음-판매--경매)
+14. [설계 노트](#14-설계-노트)
 
 ---
 
@@ -193,7 +194,7 @@ erDiagram
         varchar card_number
         varchar name
         varchar rarity
-        jsonb attributes "게임별 가변 속성, §13 참고"
+        jsonb attributes "게임별 가변 속성, §14 참고"
         varchar source "api_sync, crawl, manual"
         timestamptz synced_at
         timestamptz created_at
@@ -364,8 +365,8 @@ erDiagram
         bigint id PK
         bigint user_id FK
         bigint physical_card_id FK UK
-        varchar source "draw, purchase, event, attendance_lucky_box, last_one_bonus"
-        bigint source_ref_id "draw_logs.id 등"
+        varchar source "draw, event, attendance_lucky_box, last_one_bonus, listing_purchase, auction_won"
+        bigint source_ref_id "draw_logs.id, listing_orders.id 등"
         varchar status "held, shipping_requested, shipped, delivered, confirmed, disputed, refunded"
         numeric locked_reference_price "획득(뽑기) 시점 card_market_prices 스냅샷 — 즉시환급 계산은 이 값만 사용, 이후 시세변동 미반영"
         bigint locked_price_source_id FK "스냅샷 당시 참조한 CARD_MARKET_PRICES 레코드, 감사용"
@@ -438,21 +439,26 @@ erDiagram
 - 환급 요청 시엔 `locked_reference_price`에 `instant_exchange_policies.condition_multipliers`(§4 `condition_grade`/`grading_score` 기준)와 `buy_rate`(예: 0.8 — KREAM·스니커즈덩크류 리셀 플랫폼이 시세보다 낮게 매입하는 것과 같은 원리로 플랫폼 마진 확보)를 곱해 최종 지급액을 산출한다. `refund_requests.priced_from_locked_reference_price`에 계산에 쓰인 스냅샷 값을 그대로 복사해 감사 가능하게 남긴다.
 - 뽑기 확정 시점에 참조할 시세 데이터 자체가 없으면(`card_market_prices` 미존재) `locked_reference_price`는 NULL로 남고, 이후 환급 요청은 자동으로 `valuation_method=manual_review`(관리자 심사)로 전환된다 — 스냅샷이 없는 카드는 즉시 처리 대상이 아니다.
 - `valuation_method=instant_market_price`인 요청은 생성과 동시에 `status=paid`로 확정되고 `ledger_entries`에 `refund_credit` 항목이 즉시 기록된다(§7) — 관리자 승인 대기 없이 단일 DB 트랜잭션으로 종료.
-- `refund_credit`은 유상 잔액(`balance_type=paid`)으로 적립된다 — 뽑기에 실제 결제한 가치를 되돌려주는 성격이라 무상 적립금과 구분(§7 §12 무료 채굴 방지 상한 계산에도 포함되지 않음).
+- `refund_credit`은 **환급 포인트(`balance_type=exchange`)로 적립된다 — 뽑기·마켓 구매에는 자유롭게 쓸 수 있지만 현금 인출은 불가**(§7). 뽑기 결과물이 현금으로 되돌아가는 환전 경로를 차단해 사행성 판단 리스크를 낮추는 구조적 장치이며, 일본 오리파 플랫폼들의 표준 관행과도 일치한다. 무상 적립금과도 구분(만료 없음, §12 무료 채굴 방지 상한 계산에 미포함).
 
 ---
 
 ## 7. Payment & Wallet (복식 원장)
 
-포인트는 **유상(paid) / 무상(bonus)** 두 버킷으로 분리한다. 유상 잔액은 실제 충전한 돈이라 전자상거래법상 청약철회·환불
-대상이지만, 무상 적립금(출석/미션/이벤트/계좌이체 보너스 등으로 지급)은 환불 대상이 아니며 만료가 있다 — 이 구분이 없으면
-"이벤트로 받은 적립금까지 현금 환불해줘야 하는" 법적 리스크가 생긴다.
+포인트는 **유상(paid) / 환급(exchange) / 무상(bonus)** 세 버킷으로 분리한다.
+- **paid**: 실제 충전한 돈 — 전자상거래법상 청약철회·현금 환불 대상.
+- **exchange**: 뽑은 카드를 즉시 시세 환급(§6)해 받은 포인트 — **뽑기·마켓 구매에는 자유롭게 사용 가능하지만 현금 인출은 불가**. 뽑기 결과물이 현금으로 되돌아가는 경로(환금성)를 끊어 사행행위 판단 리스크를 구조적으로 낮추는 핵심 장치(§13 법적 리스크 노트 참고). 일본 오리파 플랫폼들의 "환급 포인트는 재뽑기 전용" 표준과 동일한 구조.
+- **bonus**: 무상 적립금(출석/미션/이벤트/계좌이체 보너스) — 환불 대상 아니며 만료 있음.
+
+이 구분이 없으면 "이벤트로 받은 적립금까지 현금 환불해줘야 하는" 법적 리스크와, "뽑기→환급→현금인출"이라는 사실상의
+환전 구조(사행성 핵심 징표)가 동시에 생긴다.
 
 ```mermaid
 erDiagram
     USERS ||--|| WALLETS : owns
     WALLETS ||--o{ LEDGER_ENTRIES : records
     WALLETS ||--o{ BONUS_CREDIT_GRANTS : "accrues"
+    WALLETS ||--o{ WALLET_HOLDS : "locked by"
     USERS ||--o{ PAYMENT_TRANSACTIONS : makes
     PAYMENT_TRANSACTIONS ||--o| CHARGE_BONUS_RULES : "may apply"
     PAYMENT_TRANSACTIONS ||--o{ PAYMENT_REFUNDS : "cancelled via"
@@ -461,7 +467,8 @@ erDiagram
     WALLETS {
         bigint id PK
         bigint user_id FK UK
-        numeric paid_balance "유상 잔액(충전액), 환불 대상, 파생 캐시"
+        numeric paid_balance "유상 잔액(충전액), 현금 환불 대상, 파생 캐시"
+        numeric exchange_balance "즉시환급 포인트 — 사용 가능·현금 인출 불가, 파생 캐시"
         numeric bonus_balance "무상 적립금, 환불 불가, 파생 캐시"
         timestamptz updated_at
     }
@@ -469,14 +476,25 @@ erDiagram
     LEDGER_ENTRIES {
         bigint id PK
         bigint wallet_id FK
-        varchar entry_type "charge, draw_spend, refund_credit, bonus_grant, bonus_expired, adjustment, withdrawal"
-        varchar balance_type "paid, bonus — 어느 버킷에 영향을 주는지"
+        varchar entry_type "charge, draw_spend, listing_purchase, refund_credit, bonus_grant, bonus_expired, adjustment, withdrawal, hold_capture"
+        varchar balance_type "paid, exchange, bonus — 어느 버킷에 영향을 주는지"
         numeric amount "부호: +적립 / -차감"
         numeric balance_after
-        varchar ref_type "payment_transaction, draw_log, refund_request, coupon_redemption, bonus_credit_grant"
+        varchar ref_type "payment_transaction, draw_log, listing_order, refund_request, coupon_redemption, bonus_credit_grant"
         bigint ref_id
         varchar idempotency_key UK
         timestamptz created_at
+    }
+
+    WALLET_HOLDS {
+        bigint id PK
+        bigint wallet_id FK
+        varchar hold_type "auction_bid"
+        bigint ref_id "auction_bids.id"
+        numeric amount "홀드 금액 — 사용가능잔액 = 잔액합 - 활성 홀드합"
+        varchar status "held, released, captured"
+        timestamptz created_at
+        timestamptz resolved_at
     }
 
     BONUS_CREDIT_GRANTS {
@@ -538,11 +556,12 @@ erDiagram
 - `idempotency_key` UNIQUE 제약으로 PG 웹훅 재전송/중복 충전 요청을 DB 레벨에서 차단.
 - `payment_transactions.pg_tid` UNIQUE로 동일 PG 거래 중복 승인 방지.
 - **계좌이체 유도**: `charge_bonus_rules`에 `method=transfer` 규칙을 활성화하면, 계좌이체 충전 승인 시 `bonus_rate`만큼 `bonus_credit_grants`(`source_type=transfer_bonus`)가 자동 지급된다. 계좌이체 PG 수수료(약 1.8%)가 카드(3.4%+)보다 낮으므로(§API_SPEC §5.1), 절감분 일부를 즉시 무상 적립금으로 돌려주는 구조 — 환불 시에는 이 무상분은 회수되고 유상 충전액만 환불된다.
-- **소진 우선순위**: 뽑기(`draw_spend`) 시 `bonus_balance`를 먼저 차감(만료 임박한 `bonus_credit_grants`부터 FIFO)하고, 소진되면 `paid_balance`를 차감 — 유저 입장엔 무상 적립금이 먼저 없어지는 게 유리하고, 플랫폼 입장엔 환불 의무가 있는 유상 잔액을 최대한 보존할 수 있다.
+- **소진 우선순위**: 뽑기(`draw_spend`)·마켓 구매 시 `bonus_balance` → `exchange_balance` → `paid_balance` 순으로 차감(bonus는 만료 임박 `bonus_credit_grants`부터 FIFO) — 유저 입장엔 만료·인출불가 재화가 먼저 없어지는 게 유리하고, 플랫폼 입장엔 현금 환불 의무가 있는 유상 잔액을 최대한 보존할 수 있다.
+- **경매 입찰 홀드**: 입찰 시 입찰액만큼 `wallet_holds`(`status=held`)로 잠가 사용가능잔액에서 제외 — 상회 입찰이 나오면 `released`, 낙찰 확정 시 `captured`로 전환하며 실제 원장 차감(`hold_capture`)이 일어난다(§13). 이중 입찰·잔액 초과 입찰을 구조적으로 차단.
 - `bonus_credit_grants.expires_at` 경과분은 배치가 `remaining_amount`를 0으로 만들며 `ledger_entries`에 `bonus_expired` 기록.
 
 **설계 포인트 — 유상 잔액 현금 환불(청약철회, `payment_refunds`)**
-- **환불 가능액 = 현재 `paid_balance`** (이미 뽑기에 소진된 금액은 환불 불가). 환불 요청이 오면 미취소 잔액이 남은 충전 건들 중 **최신 건부터 역순(LIFO)**으로 PG 부분취소를 배분한다 — 오래된 거래일수록 PG 취소 가능 기한(카드사 정책상 통상 수개월)을 넘겼을 확률이 높기 때문.
+- **환불 가능액 = 현재 `paid_balance`만** — 이미 뽑기에 소진된 금액은 물론, `exchange_balance`(뽑기 결과 환급 포인트)와 `bonus_balance`도 현금 환불 대상에서 제외된다. exchange를 제외하는 것이 환금성 차단(§7 서두, §13 법적 노트)의 핵심이다. 환불 요청이 오면 미취소 잔액이 남은 충전 건들 중 **최신 건부터 역순(LIFO)**으로 PG 부분취소를 배분한다 — 오래된 거래일수록 PG 취소 가능 기한(카드사 정책상 통상 수개월)을 넘겼을 확률이 높기 때문.
 - **보너스 회수(clawback)**: 취소되는 충전 건에 딸려 지급됐던 `charge_bonus_rules` 보너스(`bonus_credit_grants`)는 취소 비율만큼 회수한다. 이미 소진해서 회수할 무상 잔액이 부족하면 그 부족분을 환불액에서 차감(`clawed_back_bonus`) — "충전 보너스만 챙기고 원금은 환불"하는 어뷰징 차단.
 - 처리 순서(단일 트랜잭션 + PG 호출): `ledger_entries`에 `withdrawal`(-refund_amount, `balance_type=paid`) 선기록 → PG 취소 API 호출 → 성공 시 `payment_refunds.status=completed` / 실패 시 원장 역분개(보상 트랜잭션) 후 `failed`. `pg_refund_tid` UNIQUE + `idempotency_key`로 중복 취소 방지.
 - 계좌이체 충전 건 등 PG 취소가 불가한 결제수단은 지급대행 벤더(§API_SPEC §5.1)를 통한 계좌 환불로 폴백하며, 이 경우 처리 SLA가 다름을 유저에게 고지.
@@ -801,7 +820,7 @@ erDiagram
 - `loyalty_tiers`는 순수하게 **누적 유상 충전액** 기준의 결제 등급 사다리(`basic → bronze → silver → gold → vip`)이며, 위 출석 보상의 증감 로직과는 무관하다.
 - **코스메틱은 등급 달성 시에만 자동 지급**: `cosmetic_items.min_tier_required` 등급에 도달하면 배치/트리거가 즉시 `user_cosmetic_unlocks`를 생성한다(`source=tier_achieved`) — 출석 체크인을 통한 코스메틱 지급 경로는 없다. 애니메이션(webp/gif) 프로필 장식처럼 원가 없는 "과시형" 보상을 결제 등급에만 묶어 결제 유도 효과를 낸다.
 - `user_profile_equipment`는 보유(`user_cosmetic_unlocks`) 중 실제 착용 중인 것만 가리킨다.
-- `user_cosmetic_unlocks`는 `(user_id, cosmetic_item_id)` UNIQUE로 중복 해금 방지(§13.3 참고).
+- `user_cosmetic_unlocks`는 `(user_id, cosmetic_item_id)` UNIQUE로 중복 해금 방지(§14.3 참고).
 
 ---
 
@@ -947,9 +966,10 @@ erDiagram
     SETTLEMENT_HOLDS {
         bigint id PK
         bigint physical_card_id FK UK
-        bigint draw_log_id FK
+        varchar source_type "draw, listing_order — 오리파 뽑힘 또는 마켓 판매(§13) 모두 동일 에스크로"
+        bigint source_ref_id "draw_logs.id 또는 listing_orders.id"
         bigint consignor_id FK
-        numeric hold_amount "= admin_assessed_settlement_price × (1 - commission_rate)"
+        numeric hold_amount "= admin_assessed_settlement_price × (1 - commission_rate); 경매 낙찰 시 낙찰가 기준"
         varchar status "held, released, disputed, reversed"
         timestamptz hold_expires_at "배송완료(delivered_at) + 검수기간, §6 inspection_deadline_at와 동기화"
         timestamptz released_at
@@ -1091,9 +1111,104 @@ erDiagram
 
 ---
 
-## 13. 설계 노트
+## 13. Marketplace — 단품/묶음 판매 & 경매
 
-### 13.1 `cards.attributes` JSONB 스키마 예시 (게임별)
+오리파(확률형) 외에 **정가 단품 판매, 묶음(번들) 판매, 경매**까지 지원하는 확장 도메인. 판매 재고는 §4
+`physical_cards`(플랫폼 소유 + 위탁)를 그대로 재사용하고, 결제는 §7 지갑, 배송/검수/분쟁은 §6, 위탁 정산은 §11
+에스크로(`settlement_holds.source_type=listing_order`)를 공유한다 — 새 도메인이지만 돈·물건의 흐름은 기존 레일 위에서 돈다.
+
+```mermaid
+erDiagram
+    STORE_LISTINGS ||--o{ LISTING_ITEMS : contains
+    PHYSICAL_CARDS ||--o| LISTING_ITEMS : "listed as"
+    STORE_LISTINGS ||--o| LISTING_AUCTIONS : "auctioned via"
+    LISTING_AUCTIONS ||--o{ AUCTION_BIDS : receives
+    USERS ||--o{ AUCTION_BIDS : places
+    STORE_LISTINGS ||--o| LISTING_ORDERS : "sold via"
+    USERS ||--o{ LISTING_ORDERS : buys
+    CONSIGNORS ||--o{ STORE_LISTINGS : "consigns (nullable)"
+
+    STORE_LISTINGS {
+        bigint id PK
+        varchar listing_type "fixed_price, bundle, auction"
+        varchar seller_type "platform, consignor"
+        bigint consignor_id FK "seller_type=consignor일 때만 — 위탁 심사(§11) 통과 재고만"
+        varchar title
+        text description
+        numeric price "fixed_price/bundle 판매가, auction이면 NULL"
+        varchar status "draft, active, sold, cancelled, expired"
+        bigint created_by FK "발행 관리자"
+        timestamptz published_at
+        timestamptz created_at
+    }
+
+    LISTING_ITEMS {
+        bigint id PK
+        bigint listing_id FK
+        bigint physical_card_id FK UK "리스팅 활성 중 실물 잠금 — 오리파 슬롯과 동일한 1:1 원칙"
+    }
+
+    LISTING_AUCTIONS {
+        bigint id PK
+        bigint listing_id FK UK
+        numeric start_price
+        numeric buy_now_price "즉시구매가, nullable"
+        numeric min_bid_increment
+        timestamptz starts_at
+        timestamptz ends_at
+        int soft_close_extension_sec "마감 직전 입찰 시 연장 초 — 스나이핑 방지, 예: 120"
+        bigint highest_bid_id FK "현재 최고 입찰, 파생 캐시"
+        varchar status "scheduled, live, ended, settled, cancelled"
+    }
+
+    AUCTION_BIDS {
+        bigint id PK
+        bigint auction_id FK
+        bigint user_id FK
+        numeric bid_amount
+        bigint wallet_hold_id FK "입찰액 홀드(§7 wallet_holds) — 잔액 없는 허수 입찰 차단"
+        varchar status "active, outbid, won, cancelled"
+        timestamptz created_at
+    }
+
+    LISTING_ORDERS {
+        bigint id PK
+        bigint listing_id FK UK
+        bigint buyer_user_id FK
+        varchar order_type "fixed_price, bundle, auction_won, buy_now"
+        numeric total_price "경매는 낙찰가"
+        varchar ledger_entry_ref "결제 원장 참조"
+        varchar status "paid, preparing, shipped, delivered, confirmed, disputed"
+        timestamptz created_at
+    }
+```
+
+**설계 포인트**
+- **실물 잠금**: 리스팅이 `active`로 발행되면 포함된 `physical_cards`를 `status=allocated`로 전환(오리파 슬롯 배치와 동일 상태) — 같은 실물이 오리파 팩과 마켓 리스팅에 동시에 올라가는 것을 `listing_items.physical_card_id` UNIQUE + `oripa_slots.physical_card_id` UNIQUE + 상태머신으로 삼중 차단. `cancelled/expired` 시 `in_stock`으로 복귀.
+- **묶음(번들)**: `listing_items`에 N개 실물을 담으면 그대로 번들 — 구매 확정 시 N건의 `user_inventory`가 일괄 생성된다(`source=listing_purchase`).
+- **경매 진행**: 입찰은 `현재 최고가 + min_bid_increment` 이상만 허용. 입찰 성공 시 입찰액을 `wallet_holds`로 잠그고 직전 최고 입찰자의 홀드는 즉시 해제(`outbid`) — 잔액이 없는 허수 입찰과 낙찰 후 미납이 구조적으로 불가능하다. `ends_at` 직전 `soft_close_extension_sec` 이내 입찰이 들어오면 마감을 연장(스나이핑 방지).
+- **낙찰 정산**: 마감 배치가 최고 입찰을 `won` 처리 → 홀드를 `captured`로 전환(원장 차감) → `listing_orders`(`order_type=auction_won`) 생성 → 이후 배송/검수/확정 흐름은 §6과 동일. `buy_now_price` 즉시구매 시 경매를 조기 종료하고 동일 흐름.
+- **위탁 재고 판매 시 에스크로 재사용**: `seller_type=consignor` 리스팅이 판매되면 `settlement_holds`(`source_type=listing_order`)가 생성되어 §11과 동일하게 배송 확정 후 정산 — 오리파에서 뽑히든 마켓에서 팔리든 위탁자 보호 구조는 하나다.
+- 마켓 구매 결제도 §7 소진 우선순위(bonus → exchange → paid)를 따른다 — **환급 포인트(exchange)를 마켓 구매에 쓸 수 있게 함**으로써 "환급받은 가치를 플랫폼 안에서 소비"하는 선순환을 만들되 현금 인출은 계속 차단.
+
+**법적 리스크 노트 — 개인 오리파 개설 & 판매 유형별 정리**
+
+| 판매 유형 | 주체 | 법적 성격 | 리스크 평가 |
+|---|---|---|---|
+| 오리파(확률형) | **플랫폼 직영만 허용** | 랜덤박스 판매 자체는 현행법상 금지 아님. 단 사행성 판단 회피 요건 필수 | 통제 하에 중간 리스크 |
+| 오리파(확률형) | ~~개인(위탁자) 주최~~ | 개인이 영리 목적으로 다수로부터 금전을 모아 우연으로 재산상 득실을 결정하면 사행행위규제법상 **무허가 사행행위영업** 소지, 플랫폼은 방조·공동책임 리스크 | **고위험 — 지원하지 않음** |
+| 단품/묶음 정가 판매 | 플랫폼 직영 + 위탁 | 일반 통신판매(전자상거래법) — 우연성 없음 | 저위험 |
+| 경매 | 플랫폼 직영 + 위탁 | 가격 경쟁 방식으로 우연성 없음 — 사행행위 아님. 통신판매의 한 형태(기존 중고거래 플랫폼 경매와 동일) | 저위험 |
+
+- **개인 오리파를 지원하지 않는 이유**: 사행행위규제법상 "사행행위영업"(복표발행업·추첨업 등)은 경찰청 허가제이며, 개인이 허가 없이 반복·영리적으로 유료 뽑기를 주최하면 무허가 사행행위영업이 될 소지가 크다. 이 경우 플랫폼도 장소·수단 제공자로서 방조 책임을 질 수 있다. 따라서 **오리파의 구성·발행·판매 주체는 항상 플랫폼(사업자)이고, 개인은 §11 위탁으로 카드를 공급하는 역할까지만 허용**한다 — `oripa_packs.created_by`는 관리자 계정만 가능(DB 레벨로는 `admin_permissions` 보유자 검증). 개인의 판매 욕구는 저위험인 마켓플레이스(단품/묶음/경매 위탁)로 흡수한다.
+- **플랫폼 직영 오리파의 사행성 완화 요건**(원 계획서 §10 + 본 설계로 구현): ① 전 구 당첨(꽝 없음) + 최소 보장 가치, ② 등급별 잔여 수량 실시간 공개(§API §3), ③ Provably Fair 커밋-리빌(§5), ④ **환급 포인트의 현금 인출 차단**(§7 exchange 버킷 — 환금성 차단), ⑤ 확률형 아이템 확률 공개 의무(게임산업법 개정 취지 준용). 이 요건들을 갖춰도 규제기관 해석 변동 가능성이 있으므로 **출시 전 사행성 전문 변호사 자문은 필수**다.
+- 위탁자(개인)가 마켓 판매를 반복하면 통신판매업 신고 의무(전년도 50회 이상 등 기준)가 발생할 수 있다 — 플랫폼은 통신판매**중개**자로서 위탁자 신원정보 열람 제공 의무 등을 지며, 위탁자 온보딩 시 거래량 기준 신고 안내를 자동화한다(§11 `consignors` 온보딩 플로우에 고지 단계 추가).
+
+---
+
+## 14. 설계 노트
+
+### 14.1 `cards.attributes` JSONB 스키마 예시 (게임별)
 
 ```jsonc
 // Pokemon
@@ -1113,7 +1228,7 @@ erDiagram
 ```
 공통 컬럼(`rarity`, `card_number`, `name`)만 정규화하고 나머지는 JSONB로 흡수 → 신규 게임 추가 시 스키마 마이그레이션 불필요, 대신 애플리케이션 레벨(Pydantic discriminated union)에서 게임별 검증.
 
-### 13.2 인덱스 전략(주요)
+### 14.2 인덱스 전략(주요)
 - `cards`: `(card_set_id, card_number)` UNIQUE, `attributes` GIN 인덱스(검색/필터용).
 - `physical_cards`: `serial_no` UNIQUE, `status` 부분 인덱스(`WHERE status = 'in_stock'`) — 재고 조회 최적화.
 - `oripa_slots`: `(pack_id, slot_no)` UNIQUE, `physical_card_id` UNIQUE, `(pack_id, status)` 부분 인덱스(`WHERE status='available'`) — 뽑기 시 잔여 슬롯 스캔 최적화.
@@ -1136,8 +1251,12 @@ erDiagram
 - `wishlists`: `(user_id, card_id)` UNIQUE, `card_id` 인덱스(팩 오픈 시 역방향 알림 대상 조회).
 - `user_collection_entries`: `(user_id, card_id)` UNIQUE.
 - `notifications`: `(user_id, read_at)` 부분 인덱스(`WHERE read_at IS NULL`) — 미읽음 카운트 최적화.
+- `listing_items`: `physical_card_id` UNIQUE — 동일 실물 이중 리스팅 차단.
+- `auction_bids`: `(auction_id, bid_amount DESC)` 복합 인덱스 — 최고가 조회, `wallet_hold_id` UNIQUE.
+- `wallet_holds`: `(wallet_id, status)` 부분 인덱스(`WHERE status='held'`) — 사용가능잔액 계산.
+- `listing_auctions`: `(status, ends_at)` 부분 인덱스(`WHERE status='live'`) — 마감 배치 스캔.
 
-### 13.3 동시성 & 정합성 강제 요약
+### 14.3 동시성 & 정합성 강제 요약
 
 | 요구사항 | 강제 방법 |
 |---|---|
@@ -1168,3 +1287,8 @@ erDiagram
 | 다연차 뽑기 부분 성공 방지 | N연차는 단일 트랜잭션 — 잔여 슬롯 부족 시 전체 롤백(`INSUFFICIENT_REMAINING_SLOTS`), 절대 일부만 커밋되지 않음 |
 | 라스트원 상 중복/경합 지급 방지 | 마지막 슬롯을 소진한 뽑기 트랜잭션 내에서만 지급 — 팩당 마지막 슬롯은 물리적으로 1개이므로 경합 자체가 불가능 |
 | 도감 중복 등록 방지 | `user_collection_entries.(user_id, card_id)` UNIQUE + upsert |
+| 뽑기 환급 포인트의 현금 인출 차단(환금성 차단) | `refund_credit`은 `balance_type=exchange`로만 적립, `payment_refunds` 환불 가능액 계산은 `paid_balance`만 참조 — 애플리케이션·원장 이중 강제 |
+| 동일 실물의 오리파/마켓 이중 판매 방지 | `oripa_slots.physical_card_id` UNIQUE + `listing_items.physical_card_id` UNIQUE + `physical_cards.status` 상태머신(`in_stock→allocated`) 삼중 차단 |
+| 허수 입찰/낙찰 미납 방지 | 입찰 시 `wallet_holds`로 입찰액 선점(잔액 부족 시 입찰 자체 불가), 낙찰 시 `captured` 전환으로만 결제 |
+| 경매 동시 입찰 경합 | 경매별 Redis 락 + `bid_amount > 현재최고가 + min_bid_increment` 검증을 단일 트랜잭션에서 수행 |
+| 개인의 오리파 발행 차단 | `oripa_packs.created_by`는 `admin_permissions` 보유 계정만 허용(애플리케이션 + DB 트리거 검증) — §13 법적 리스크 노트 |

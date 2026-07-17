@@ -15,8 +15,9 @@
 7. [Admin Service](#7-admin-service)
 8. [Consignment & Settlement Service](#8-consignment--settlement-service)
 9. [Offline Store Check-in Service](#9-offline-store-check-in-service)
-10. [WebSocket — 실시간 뽑기 피드](#10-websocket--실시간-뽑기-피드)
-11. [에러 코드 표준](#11-에러-코드-표준)
+10. [Marketplace Service — 단품/묶음/경매](#10-marketplace-service--단품묶음경매)
+11. [WebSocket — 실시간 뽑기 피드](#11-websocket--실시간-뽑기-피드)
+12. [에러 코드 표준](#12-에러-코드-표준)
 
 ---
 
@@ -422,7 +423,7 @@ Idempotency-Key: 9a1f4c3d-...
   "valuation_method": "instant_market_price",
   "priced_from_locked_reference_price": 45000,
   "refund_points": 18000,
-  "wallet_balance_after": { "paid": 18000, "bonus": 0 },
+  "wallet_balance_after": { "paid": 0, "exchange": 18000, "bonus": 0 },
   "processed_at": "2026-07-17T10:05:00Z"
 }
 
@@ -528,11 +529,14 @@ Idempotency-Key: 9a1f4c3d-...
 GET /users/me/wallet
 {
   "paid_balance": 46500,
+  "exchange_balance": 18000,
   "bonus_balance": 2000,
-  "total_balance": 48500,
+  "total_balance": 66500,
+  "cash_refundable_balance": 46500,
   "updated_at": "2026-07-17T09:55:00Z"
 }
 ```
+- `exchange_balance`(즉시환급 포인트)는 뽑기·마켓 구매에 자유롭게 쓸 수 있지만 **현금 인출 불가**(`cash_refundable_balance`에 미포함) — 사행성 판단의 핵심 징표인 환금성을 차단하는 설계(§ERD.md §7·§13). 소진 우선순위는 bonus → exchange → paid.
 
 **GET /users/me/bonus-credits — 응답 예시**
 ```json
@@ -563,7 +567,7 @@ GET /users/me/wallet
 // 202 Response
 { "id": 910, "status": "processing", "refund_amount": 46500, "clawed_back_bonus": 1395, "net_refund": 45105 }
 ```
-- 환불 가능액은 **현재 유상 잔액**까지 — 이미 뽑기에 소진한 금액은 환불 불가. 원거래 배분은 최신 충전 건부터 역순(LIFO)으로 PG 부분취소한다(§ERD.md §7).
+- 환불 가능액은 **현재 유상 잔액(`paid_balance`)만** — 이미 뽑기에 소진한 금액, 환급 포인트(`exchange_balance`), 무상 적립금은 환불 불가. 원거래 배분은 최신 충전 건부터 역순(LIFO)으로 PG 부분취소한다(§ERD.md §7).
 - 취소되는 충전 건에 딸려 지급된 충전 보너스는 비율대로 회수되며, 이미 소진해 회수할 수 없는 부분은 환불액에서 차감(`clawed_back_bonus`) — 사전 견적을 `refundable` 조회로 투명하게 안내.
 - 실패: `422 REFUND_EXCEEDS_REFUNDABLE`(가능액 초과), `409 REFUND_ALREADY_IN_PROGRESS`(동일 유저의 처리중 환불 존재).
 - PG 취소가 불가한 결제수단/기한 경과 건은 지급대행 벤더 경유 계좌 환불로 폴백(처리 기간 상이함을 응답 `message`로 고지).
@@ -991,6 +995,11 @@ GET /users/me/wallet
 위탁자(개인 판매자)가 카드를 출품하고 정산받는 전체 흐름. 구매자 쪽 배송/검수 API는 §4에 있으며, 이 섹션은
 위탁자 온보딩과 정산 파이프라인을 다룬다. 데이터 모델은 `docs/ERD.md` §11 참고.
 
+> **개인 오리파 불가**: 위탁자가 할 수 있는 것은 (a) 위탁 카드가 **플랫폼이 구성한** 오리파에 편입되는 것, (b) 마켓플레이스
+> 단품/묶음/경매 리스팅 요청(§10.1)까지다. 개인이 오리파(확률형 뽑기)를 직접 개설·주최하는 기능은 사행행위규제법상
+> 무허가 사행행위영업 및 플랫폼 방조 리스크 때문에 지원하지 않는다 — 상세 근거는 `docs/ERD.md` §13 법적 리스크 노트.
+> 위탁 온보딩 시 마켓 판매 반복(연 50회 이상 등)에 따른 통신판매업 신고 의무 안내를 자동 고지한다.
+
 | Method | Path | Auth | 설명 |
 |---|---|---|---|
 | POST | `/consignors/apply` | Bearer | 위탁자 신청 (본인인증, 정산 계좌 등록) |
@@ -1142,7 +1151,82 @@ sequenceDiagram
 
 ---
 
-## 10. WebSocket — 실시간 뽑기 피드
+## 10. Marketplace Service — 단품/묶음/경매
+
+오리파 외 판매 채널: 정가 단품·묶음(번들) 판매와 경매. 데이터 모델은 `docs/ERD.md` §13, 위탁 재고 판매 시 정산
+에스크로는 §8과 동일 레일을 공유한다. **오리파(확률형)의 발행 주체는 항상 플랫폼이며, 개인(위탁자)은 마켓플레이스
+리스팅(비확률형)까지만 위탁 가능**하다 — 법적 근거는 §ERD.md §13 법적 리스크 노트 참고.
+
+| Method | Path | Auth | 설명 |
+|---|---|---|---|
+| GET | `/listings` | - | 리스팅 목록 (`?type=fixed_price\|bundle\|auction&game=&status=active`) |
+| GET | `/listings/{id}` | - | 리스팅 상세 (포함 실물 카드들의 상태/그레이딩/사진, 경매면 현재가·마감시각) |
+| POST | `/listings/{id}/purchase` | Bearer + Idempotency-Key | 정가/번들 즉시 구매 (지갑 차감: bonus → exchange → paid) |
+| POST | `/listings/{id}/bids` | Bearer + Idempotency-Key | 경매 입찰 — 입찰액만큼 지갑 홀드 |
+| GET | `/listings/{id}/bids` | - | 입찰 이력 (입찰자 닉네임 마스킹) |
+| POST | `/listings/{id}/buy-now` | Bearer + Idempotency-Key | 즉시구매가 결제로 경매 조기 종료 |
+| GET | `/users/me/bids` | Bearer | 내 입찰 현황 (`?status=active`) |
+| GET | `/users/me/listing-orders` | Bearer | 내 마켓 구매 이력 |
+
+**POST /listings/{id}/purchase — 요청/응답 예시 (번들)**
+```json
+// Request
+{ }
+
+// 200 Response
+{
+  "order_id": 7712,
+  "order_type": "bundle",
+  "total_price": 55000,
+  "items": [
+    { "physical_card_id": 90112, "card_name": "루피 리더 패럴렐", "condition_grade": "PSA9" },
+    { "physical_card_id": 90113, "card_name": "조로 SR", "condition_grade": "NM" }
+  ],
+  "wallet_balance_after": { "paid": 10000, "exchange": 0, "bonus": 0 },
+  "shipping_hint": "인벤토리에서 배송 신청 또는 즉시 환급을 선택하세요."
+}
+```
+- 구매 확정 시 포함 실물 전부가 `user_inventory`(`source=listing_purchase`)로 이동 — 이후 배송/검수/이의제기/즉시환급 흐름은 §4와 동일.
+- 위탁 리스팅이면 같은 트랜잭션에서 `settlement_holds`(`source_type=listing_order`)가 생성되어 §8 에스크로를 탄다.
+- 실패: `409 LISTING_NOT_ACTIVE`(이미 판매/취소됨), `402 INSUFFICIENT_BALANCE`.
+
+**POST /listings/{id}/bids — 요청/응답 예시**
+```json
+// Request
+{ "bid_amount": 72000 }
+
+// 201 Response
+{
+  "bid_id": 3301,
+  "auction_id": 88,
+  "bid_amount": 72000,
+  "status": "active",
+  "held_amount": 72000,
+  "current_highest": true,
+  "ends_at": "2026-07-20T21:00:00Z",
+  "extended": false
+}
+```
+- 입찰 성공 시 입찰액이 지갑 홀드(`wallet_holds`)로 잠기고, 직전 최고 입찰자의 홀드는 즉시 해제된다 — 낙찰 후 미납이 구조적으로 불가능.
+- `현재 최고가 + min_bid_increment` 미만이면 `422 BID_TOO_LOW`. 마감 후 입찰은 `409 AUCTION_CLOSED`. 마감 직전(`soft_close_extension_sec` 이내) 입찰이면 마감이 연장되고 응답의 `extended: true`로 안내.
+- 낙찰 처리(마감 배치): 최고 입찰 `won` → 홀드 `captured`(원장 차감) → `listing_orders`(`order_type=auction_won`) 생성 → WS/알림 통지. 유찰 시 모든 홀드 해제 후 리스팅 `expired`.
+
+### 10.1 관리자/위탁자 리스팅 관리
+
+| Method | Path | Auth | 설명 |
+|---|---|---|---|
+| POST | `/admin/listings` | Admin | 직영 리스팅 생성 (실물 선택, 정가/번들/경매 설정) |
+| POST | `/admin/listings/{id}/publish` | Admin | 리스팅 발행 — 포함 실물 `allocated` 잠금 |
+| POST | `/admin/listings/{id}/cancel` | Admin | 리스팅 취소 — 실물 `in_stock` 복귀 (입찰 존재 시 전원 홀드 해제) |
+| POST | `/consignors/me/listing-requests` | Bearer(위탁자) | 위탁 재고의 마켓 판매 요청 (판매 방식·희망가 제안, 관리자 승인 후 발행) |
+| GET | `/admin/listing-requests?status=pending` | Admin | 위탁 리스팅 요청 심사 대기열 |
+
+- 위탁자는 리스팅을 직접 발행할 수 없고 **요청 → 관리자 승인 → 플랫폼 발행** 구조 — 가격 조작·허위 매물 방지 및 통신판매중개자 책임 관리.
+- 오리파 팩 생성 권한(§7.3)은 관리자 전용이며 위탁자에게는 어떤 경로로도 부여되지 않는다(§ERD.md §13 법적 리스크 노트).
+
+---
+
+## 11. WebSocket — 실시간 뽑기 피드
 
 `wss://api.<domain>/ws/feed`
 
@@ -1164,7 +1248,7 @@ sequenceDiagram
 
 ---
 
-## 11. 에러 코드 표준
+## 12. 에러 코드 표준
 
 | HTTP | code | 설명 |
 |---|---|---|
@@ -1206,3 +1290,7 @@ sequenceDiagram
 | 422 | `REFUND_EXCEEDS_REFUNDABLE` | 현금 환불 요청액이 환불 가능액(유상 잔액) 초과 |
 | 409 | `REFUND_ALREADY_IN_PROGRESS` | 처리중인 현금 환불 건이 이미 존재 |
 | 409 | `WITHDRAWAL_BLOCKED` | 잔액/미배송 카드/위탁 정산 보류 미해소 상태의 회원 탈퇴 시도 (사유 목록 포함 응답) |
+| 409 | `LISTING_NOT_ACTIVE` | 이미 판매/취소/만료된 리스팅 구매 시도 |
+| 422 | `BID_TOO_LOW` | 입찰액이 `현재 최고가 + min_bid_increment` 미만 |
+| 409 | `AUCTION_CLOSED` | 마감된 경매에 입찰 시도 |
+| 403 | `ORIPA_CREATION_FORBIDDEN` | 관리자가 아닌 계정(위탁자 포함)의 오리파 팩 생성 시도 — 개인 오리파 미지원(법적 리스크) |
