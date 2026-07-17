@@ -3,6 +3,8 @@
 `docs/ERD.md`의 데이터 모델을 기반으로 한 REST API 설계. FastAPI 구현을 전제로 하며, 서비스 경계는
 프로젝트 계획서 §2 아키텍처(Auth / Card / Oripa / Inventory / Payment / Event / Admin)를 따른다.
 
+> 구현·운영 시 준수해야 할 보안 요구사항 전체 체크리스트는 **`SECURITY.md`** 참고.
+
 ## 목차
 
 0. [공통 규약](#0-공통-규약)

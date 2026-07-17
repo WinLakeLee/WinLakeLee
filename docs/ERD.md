@@ -5,6 +5,9 @@
 GENERATED ALWAYS AS IDENTITY PK`, `created_at timestamptz DEFAULT now()`를 공통으로 가진다(표에서는
 생략하지 않고 명시).
 
+> 구현·운영 시 준수해야 할 보안 요구사항 전체 체크리스트는 **`SECURITY.md`** 참고 — 본 문서의 보안 장치들과
+> 위협별 교차 인덱스를 제공한다.
+
 ## 목차
 
 1. [전체 도메인 개요](#1-전체-도메인-개요)
