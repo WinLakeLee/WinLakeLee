@@ -164,6 +164,7 @@ erDiagram
     GAMES ||--o{ CARD_SETS : contains
     CARD_SETS ||--o{ CARDS : contains
     CARDS ||--o{ CARD_IMAGES : has
+    CARDS ||--o{ CARD_MARKET_PRICES : "priced by"
     GAMES ||--o{ PRODUCTS : offers
 
     GAMES {
@@ -213,12 +214,21 @@ erDiagram
         text description
         timestamptz created_at
     }
+
+    CARD_MARKET_PRICES {
+        bigint id PK
+        bigint card_id FK
+        numeric reference_price "그레이딩 PSA10/최상급 기준 시세"
+        varchar source "tcgplayer, cardrush_ja, manual_admin"
+        timestamptz fetched_at
+    }
 ```
 
 **설계 포인트**
 - `cards.attributes`(JSONB)로 게임별 스키마 차이를 흡수 — 별도 마이그레이션 없이 신규 게임 추가 가능.
 - `(card_set_id, card_number)` 복합 UNIQUE로 동일 세트 내 중복 등록 방지.
 - `source`로 API 동기화/크롤링/수동 입력 이력을 구분해 배치 재동기화 시 수동 보정 데이터 덮어쓰기 방지.
+- `card_market_prices`는 TCGPlayer·일본 토레카 시세 등 외부 시세를 주기적으로 동기화(§10 데이터 수집 파이프라인과 유사한 배치)해 카드 단위 최신 시세를 유지 — §6 즉시 시세 환급, 원래 계획서 §8 "카드 시세 연동" 기능의 기반 데이터가 된다. `fetched_at`이 오래된(신뢰 만료) 시세는 §6 `instant_exchange_policies.max_price_age_hours`에 의해 즉시 환급 대상에서 제외되고 수동 심사로 넘어간다.
 
 ---
 
@@ -239,11 +249,12 @@ erDiagram
         varchar grading_cert_no
         varchar condition_grade "S/A/B/C 또는 NM/LP/MP/HP/DMG"
         text condition_note
-        varchar status "in_stock, allocated, shipped, refunded, lost"
+        varchar status "in_stock, allocated, shipped, refunded, lost, cleared"
         varchar ownership_type "platform_owned, consigned — §11 참고"
         bigint consignor_id FK "ownership_type=consigned일 때만, §11 CONSIGNORS 참조"
         numeric settlement_price "위탁 카드가 뽑혀 확정될 때 위탁자에게 지급할 금액, consigned 전용"
         numeric acquired_cost "매입 원가(platform_owned), 마진 계산용"
+        boolean clearance_eligible "장기 체화/비인기 재고 — §8 출석 럭키박스 실물 보상 풀에 편입 가능"
         timestamptz created_at
     }
 
@@ -262,6 +273,7 @@ erDiagram
 - `status = allocated`는 팩에 배치되었지만 아직 안 뽑힌 상태, `shipped`/`refunded`는 §6 인벤토리 처리 결과와 동기화.
 - 실물 촬영 이미지는 관리자 업로드 시 리사이즈·워터마크 파이프라인(Celery)을 거쳐 `physical_card_images`에 다건 저장.
 - `ownership_type=consigned` 카드는 `consignor_id`/`settlement_price`가 채워지며, 뽑힌 뒤 정산 보류(에스크로) 흐름을 탄다 — 상세 설계는 §11.
+- `clearance_eligible=true`(관리자가 장기 미판매·비인기 카드에 수동 표시)인 `in_stock` 카드는 오리파 팩에 배치하는 대신 §8 출석 럭키박스의 실물 보상 풀로 돌려 재고를 소진할 수 있다 — 지급 시 `status=cleared`로 전환.
 
 ---
 
@@ -339,12 +351,13 @@ erDiagram
     USER_INVENTORY ||--o| SHIPPING_REQUEST_ITEMS : included
     USER_INVENTORY ||--o| REFUND_REQUESTS : "refunded via"
     USER_INVENTORY ||--o| DELIVERY_DISPUTES : "disputed via"
+    CARD_MARKET_PRICES ||--o{ REFUND_REQUESTS : "prices via"
 
     USER_INVENTORY {
         bigint id PK
         bigint user_id FK
         bigint physical_card_id FK UK
-        varchar source "draw, purchase, event"
+        varchar source "draw, purchase, event, attendance_lucky_box"
         bigint source_ref_id "draw_logs.id 등"
         varchar status "held, shipping_requested, shipped, delivered, confirmed, disputed, refunded"
         timestamptz acquired_at
@@ -387,18 +400,34 @@ erDiagram
         bigint user_inventory_id FK UK
         bigint user_id FK
         numeric refund_points
+        varchar valuation_method "instant_market_price, manual_review"
+        bigint market_price_ref_id FK "CARD_MARKET_PRICES 참조, instant_market_price일 때만"
+        numeric buy_rate_applied "적용된 매입률, 예: 0.8"
         varchar status "pending, approved, rejected, paid"
         timestamptz requested_at
         timestamptz processed_at
+    }
+
+    INSTANT_EXCHANGE_POLICIES {
+        bigint id PK
+        numeric buy_rate "시세 대비 매입률, 예: 0.8 = 시세의 80%"
+        jsonb condition_multipliers "그레이딩/컨디션별 배율, 예: {\"PSA10\":1.0,\"PSA9\":0.7,\"NM\":0.5,\"DMG\":0.05}"
+        int max_price_age_hours "이 시간 초과한 시세는 신뢰하지 않고 manual_review로 전환"
+        boolean is_active
     }
 ```
 
 **설계 포인트**
 - `user_inventory.physical_card_id`에 UNIQUE 제약 → 동일 실물 카드가 두 유저 인벤토리에 동시 존재 불가.
 - 배송 신청은 여러 인벤토리 항목을 하나의 `shipping_requests`로 묶어(§8 "배송 통합") 배송비 절감.
-- 환급 선택 시 `refund_requests.status = paid` 전환과 동시에 `ledger_entries`에 `refund_credit` 항목 생성 (§7).
 - **수령 확인/검수 기간**: `delivered_at` 이후 `inspection_deadline_at`까지 구매자가 이의를 제기하지 않으면 자동으로 `confirmed_at`이 채워진다(또는 구매자가 직접 조기 확정). 이 시점이 위탁 카드의 정산 보류(`settlement_holds`) 해제 트리거다 — 상세는 §11.
 - `delivery_disputes`는 위탁/플랫폼 소유 카드 모두에 적용되는 공통 이의제기 창구이며, `consignor_id`가 있는 케이스는 처리 결과에 따라 §11의 정산 보류가 취소·차감될 수 있다.
+
+**설계 포인트 — 즉시 시세 환급 (뽑은 카드를 배송 대신 바로 현금화)**
+- 뽑은 카드는 배송 신청 전 언제든 `refund_requests`로 "환급(즉시 교환)"을 요청할 수 있다. `card_market_prices`(§3)에서 해당 카드의 최신 참조 시세를 조회하고, `instant_exchange_policies.condition_multipliers`로 그 실물의 `condition_grade`/`grading_score`(§4)에 따른 배율을 곱한 뒤, `buy_rate`(예: 0.8 — KREAM·스니커즈덩크류 리셀 플랫폼의 매입가가 시세보다 낮게 책정되는 것과 같은 원리로 플랫폼 마진 확보)를 적용해 최종 지급액을 산출한다.
+- 계산에 쓸 시세가 `max_price_age_hours`보다 오래됐거나 아예 없으면(`valuation_method`를 자동으로 `manual_review`로 전환) 기존처럼 관리자 심사 큐로 넘어간다 — 신뢰할 수 있는 시세가 있을 때만 즉시 처리.
+- `valuation_method=instant_market_price`인 요청은 생성과 동시에 `status=paid`로 확정되고 `ledger_entries`에 `refund_credit` 항목이 즉시 기록된다(§7) — 관리자 승인 대기 없이 단일 DB 트랜잭션으로 종료.
+- `refund_credit`은 유상 잔액(`balance_type=paid`)으로 적립된다 — 뽑기에 실제 결제한 가치를 되돌려주는 성격이라 무상 적립금과 구분(§7 §12 무료 채굴 방지 상한 계산에도 포함되지 않음).
 
 ---
 
@@ -545,8 +574,8 @@ erDiagram
         bigint policy_id FK
         varchar outcome_code "small, medium, jackpot"
         numeric probability "policy_id 내 합계 1.0"
-        varchar reward_type "bonus_credit, free_draw_ticket"
-        numeric reward_value
+        varchar reward_type "bonus_credit, free_draw_ticket, physical_card_clearance"
+        numeric reward_value "reward_type=physical_card_clearance일 땐 EV 계산용 참고가(§4 clearance 풀의 평균 시세)"
         boolean is_active
     }
 
@@ -683,6 +712,7 @@ erDiagram
 - **서서히, 감지 못하게 감소**: 무결제 상태가 `decay_start_days`(예: 15일)를 넘기면 그 즉시 확 줄이는 게 아니라, `decay_window_days`(예: 90일)에 걸쳐 서서히 `decay_floor_multiplier`(예: 0.7)까지 하락시킨다 — 하루 변화폭이 1% 미만이라 유저가 "오늘 갑자기 줄었다"고 체감하지 못한다. 절벽형 등급 강등은 두지 않는다.
 - **마일스톤 스파이크**: `milestone_days`(예: 7·10·20·30·50·100일차)에는 결제 여부와 무관하게 `milestone_bonus_multiplier`를 곱한 고가치 보상을 지급해 장기 이탈을 방지하고 "다음 마일스톤까지 채워야지" 하는 동기를 유지시킨다.
 - **장기 무결제자 = 확정형 → 확률형(럭키박스) 전환**: `long_term_free_threshold_days`를 넘긴 무결제 유저는 보상 방식이 `attendance_lucky_box_outcomes`의 확률 테이블로 전환된다. 예: 88% 확률로 소액, 10% 확률로 중간값, 2% 확률로 잭팟(무료뽑기권) — **기댓값 자체도 그 시점의 decay 적용 동적 보상보다 살짝 낮게**(`lucky_box_target_ev_ratio`, 예: 0.85) 설계한다. 즉 평균적으로는 이전보다 조금 덜 받지만, 분산이 커서 "가끔 크게 받을 수도 있다"는 기대감만 남기고 매일 조금씩 깎이는 느낌은 주지 않는다 — 기댓값을 부풀리지 않으면서도 체감상의 지루한 하락 대신 변동성으로 흥미를 유지하는 것이 핵심.
+- **비인기 재고 소진 채널**: `reward_type=physical_card_clearance`를 쓰면 잭팟/중간 등급 보상을 현금성 재화 대신 `physical_cards.clearance_eligible=true`(§4, 장기 체화·비인기 카드)인 실물로 지급할 수 있다 — 유저에게는 "실물 카드 당첨"이라는 체감가치 큰 이벤트지만, 플랫폼 입장에서는 팔리지 않던 재고를 원가 이상 지출 없이 정리하는 효과가 있어 `lucky_box_target_ev_ratio` 제약을 지키면서도 매력적인 보상을 구성하기 쉽다. 당첨 시점에 `clearance_eligible` 재고가 소진되어 없으면 동일 EV의 `bonus_credit`으로 자동 대체 지급한다(지급 실패를 노출하지 않음).
 - **결제 관련 혜택은 그대로**: 위 감소/럭키박스 전환은 오직 **출석 보상**에만 적용된다. 배송비 할인, 충전 보너스(§7 `charge_bonus_rules`), PG 결제 조건 등 결제와 관련된 혜택·조건은 결제 이력과 무관하게 모든 유저에게 동일하게 적용한다 — 장기 무결제자를 다른 영역에서까지 차별하지 않는다.
 
 **설계 포인트 — 로열티 등급 & 코스메틱 (출석 보상과는 완전히 분리)**
@@ -1015,6 +1045,8 @@ erDiagram
 - `store_checkins`: `qr_issuance_id` UNIQUE, `(user_id, created_at)` 복합 인덱스 — 일/주 한도 집계 및 이동거리 이상탐지용.
 - `attendance_lucky_box_outcomes`: `policy_id` 인덱스, `SUM(probability) = 1.0`은 애플리케이션 레벨 검증(저장 전).
 - `user_cosmetic_unlocks`: `(user_id, cosmetic_item_id)` UNIQUE.
+- `card_market_prices`: `(card_id, fetched_at)` 복합 인덱스 — 최신 시세 조회 최적화.
+- `physical_cards`: `clearance_eligible` 부분 인덱스(`WHERE status='in_stock' AND clearance_eligible=true`) — 럭키박스 실물 보상 풀 스캔용.
 
 ### 13.3 동시성 & 정합성 강제 요약
 
@@ -1039,3 +1071,4 @@ erDiagram
 | 럭키박스 확률 합계 오류 방지 | `attendance_lucky_box_outcomes` 저장 시 `SUM(probability) = 1.0` 애플리케이션 검증, 불일치 시 저장 거부 |
 | 럭키박스 기댓값이 일반 보상보다 높아지는 것 방지 | 저장 시 `Σ(probability × reward_value) <= 그 시점 decay 적용 동적 보상 × lucky_box_target_ev_ratio`(1.0 미만)를 검증, 위반 시 저장 거부 |
 | 코스메틱 중복 해금 방지 | `user_cosmetic_unlocks.(user_id, cosmetic_item_id)` UNIQUE |
+| 신뢰할 수 없는 시세로 즉시 환급되는 것 방지 | `card_market_prices.fetched_at`이 `instant_exchange_policies.max_price_age_hours`를 초과하면 `valuation_method`가 자동으로 `manual_review`로 전환, 즉시 지급(`status=paid`) 경로 차단 |

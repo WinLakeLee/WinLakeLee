@@ -204,7 +204,7 @@ sequenceDiagram
 | GET | `/games/{game_code}/sets` | - | 게임별 확장팩/세트 목록 |
 | GET | `/cards` | - | 카드 검색 (`?game=&set=&rarity=&q=&cursor=`) |
 | GET | `/cards/{id}` | - | 카드 상세 (공식 이미지 + attributes) |
-| GET | `/cards/{id}/price-history` | - | 시세 그래프 데이터 (§8 추가 제안 기능) |
+| GET | `/cards/{id}/price-history` | - | 시세 그래프 데이터 (TCGPlayer·토레카 등 외부 시세 동기화, §ERD.md §3 `card_market_prices`) |
 
 **GET /cards/{id} — 응답 예시**
 ```json
@@ -221,6 +221,20 @@ sequenceDiagram
   ]
 }
 ```
+
+**GET /cards/{id}/price-history — 응답 예시**
+```json
+{
+  "reference_price": 45000,
+  "source": "tcgplayer",
+  "fetched_at": "2026-07-17T03:00:00Z",
+  "history": [
+    { "date": "2026-07-10", "price": 42000 },
+    { "date": "2026-07-17", "price": 45000 }
+  ]
+}
+```
+- `reference_price`는 최상급(PSA10 등) 기준가 — 개별 실물의 상태 반영 전 원시값. 이 값이 §4 즉시 시세 환급 계산의 입력이 된다.
 
 ---
 
@@ -339,7 +353,8 @@ Idempotency-Key: 9a1f4c3d-...
 | GET | `/users/me/shipping-requests` | Bearer | 내 배송 신청 이력 |
 | POST | `/shipping-requests/{id}/confirm-receipt` | Bearer | 수령 확인(조기 확정) — 위탁 카드 정산 보류 해제 트리거 |
 | POST | `/shipping-requests/{id}/dispute` | Bearer | 수령 물품 이의제기 (검수기간 내) — 정산 보류 동결 |
-| POST | `/refund-requests` | Bearer | 포인트 환급(매입) 신청 |
+| GET | `/users/me/inventory/{id}/exchange-quote` | Bearer | 즉시 시세 환급 시 예상 지급액 미리보기 (배송 신청 전 확인용) |
+| POST | `/refund-requests` | Bearer | 포인트 환급(매입) 신청 — 신뢰 가능한 시세가 있으면 즉시 처리, 없으면 관리자 심사 |
 | GET | `/refund-requests/{id}` | Bearer | 환급 신청 상태 조회 |
 
 **POST /shipping-requests — 요청 예시**
@@ -359,15 +374,40 @@ Idempotency-Key: 9a1f4c3d-...
 }
 ```
 
+**GET /users/me/inventory/{id}/exchange-quote — 응답 예시**
+```json
+{
+  "reference_price": 45000,
+  "condition_grade": "NM",
+  "condition_multiplier": 0.5,
+  "buy_rate": 0.8,
+  "estimated_refund_points": 18000,
+  "quote_basis": "instant_market_price",
+  "price_fetched_at": "2026-07-17T03:00:00Z"
+}
+```
+- 계산식: `reference_price(45000) × condition_multiplier(0.5) × buy_rate(0.8) = 18000`. 시세가 오래되어(`max_price_age_hours` 초과) 신뢰할 수 없으면 `quote_basis: "manual_review"`와 함께 확정 금액 대신 "관리자 심사 후 안내" 메시지를 반환한다.
+
 **POST /refund-requests — 요청/응답 예시**
 ```json
 // Request
 { "user_inventory_id": 88250 }
 
-// 201 Response
-{ "id": 771, "status": "pending", "estimated_refund_points": 800 }
+// 201 Response — 신뢰 가능한 시세 존재, 즉시 확정
+{
+  "id": 771,
+  "status": "paid",
+  "valuation_method": "instant_market_price",
+  "refund_points": 18000,
+  "wallet_balance_after": { "paid": 18000, "bonus": 0 },
+  "processed_at": "2026-07-17T10:05:00Z"
+}
+
+// 201 Response — 시세 없음/신뢰 불가 → 기존 관리자 심사 큐로
+{ "id": 772, "status": "pending", "valuation_method": "manual_review", "estimated_refund_points": null }
 ```
-- 승인(`admin`) 시 `ledger_entries`에 `refund_credit` 자동 기록되며 `status=paid`로 전환.
+- `valuation_method=instant_market_price`인 경우 생성과 동시에 `status=paid`로 확정되고 `ledger_entries`에 `refund_credit`(`balance_type=paid`)이 즉시 기록된다 — 관리자 승인 대기 없이 단일 트랜잭션으로 종료(§ERD.md §6).
+- `manual_review`로 전환된 건은 기존과 동일하게 `POST /admin/refund-requests/{id}/approve`로 관리자가 처리한다.
 
 **POST /shipping-requests/{id}/confirm-receipt / dispute — 수령 확인 & 이의제기**
 ```json
@@ -666,6 +706,25 @@ GET /users/me/wallet
 | POST | `/admin/physical-cards/{id}/images` | 실물 촬영 이미지 업로드 (자동 리사이즈/워터마크) |
 | GET | `/admin/physical-cards?status=in_stock` | 재고 조회 |
 | POST | `/admin/physical-cards/stocktake` | 재고 실사 등록 (DB-실물 불일치 보정) |
+| PATCH | `/admin/physical-cards/{id}/clearance` | 장기 체화·비인기 카드로 표시(`clearance_eligible`) — 출석 럭키박스 실물 보상 풀 편입 |
+| POST | `/admin/card-market-prices/sync` | 외부 시세(TCGPlayer/토레카 등) 동기화 수동 트리거 |
+| POST | `/admin/instant-exchange-policies` | 즉시 시세 환급 정책 설정 (매입률, 컨디션 배율, 시세 신뢰 기한) |
+
+**PATCH /admin/physical-cards/{id}/clearance — 요청 예시**
+```json
+{ "clearance_eligible": true, "reason": "6개월 이상 미판매, 팩 편성 우선순위 낮음" }
+```
+
+**POST /admin/instant-exchange-policies — 요청 예시**
+```json
+{
+  "buy_rate": 0.8,
+  "condition_multipliers": { "PSA10": 1.0, "PSA9": 0.7, "NM": 0.5, "LP": 0.35, "MP": 0.2, "HP": 0.1, "DMG": 0.05 },
+  "max_price_age_hours": 72,
+  "is_active": true
+}
+```
+- KREAM·스니커즈덩크 같은 리셀 플랫폼이 시세보다 낮게 매입하는 것과 동일한 원리로 `buy_rate`를 두어 마진을 확보한다. `max_price_age_hours`를 넘긴 시세는 즉시 환급 대상에서 자동 제외된다.
 
 ### 7.3 오리파 팩 관리
 | Method | Path | 설명 |
@@ -788,11 +847,12 @@ GET /users/me/wallet
   "outcomes": [
     { "outcome_code": "small", "probability": 0.90, "reward_type": "bonus_credit", "reward_value": 60 },
     { "outcome_code": "medium", "probability": 0.09, "reward_type": "bonus_credit", "reward_value": 250 },
-    { "outcome_code": "jackpot", "probability": 0.01, "reward_type": "bonus_credit", "reward_value": 850 }
+    { "outcome_code": "jackpot", "probability": 0.01, "reward_type": "physical_card_clearance", "reward_value": 800 }
   ]
 }
 ```
-- `probability` 합이 1.0이 아니면 `422 VALIDATION_ERROR` 반환. 위 예시의 기댓값은 `0.90×60 + 0.09×250 + 0.01×850 = 85`로, baseline(100) 대비 `lucky_box_target_ev_ratio=0.85`를 만족한다 — 이 제약을 어겨 기댓값이 baseline보다 높아지도록 등록하면 `422 LUCKY_BOX_EV_TOO_HIGH`로 거부된다. 대부분(90%)은 `small`만 받아 체감가치는 더욱 낮지만, 평균 지급액 자체도 늘리지 않는 것이 원칙이다.
+- `probability` 합이 1.0이 아니면 `422 VALIDATION_ERROR` 반환. 위 예시의 기댓값은 `0.90×60 + 0.09×250 + 0.01×800 = 84.5`로, baseline(100) 대비 `lucky_box_target_ev_ratio=0.85` 이하를 만족한다 — 이 제약을 어겨 기댓값이 baseline보다 높아지도록 등록하면 `422 LUCKY_BOX_EV_TOO_HIGH`로 거부된다. 대부분(90%)은 `small`만 받아 체감가치는 더욱 낮다.
+- `jackpot`을 `physical_card_clearance`로 지정하면, 당첨 시 `physical_cards.clearance_eligible=true`인 재고 중 하나가 무작위로 배정되어 `user_inventory`에 즉시 편입된다(`source=attendance_lucky_box`) — 유저에게는 "실물 당첨"이라는 체감가치 큰 이벤트지만, 플랫폼은 팔리지 않던 재고를 정리하는 효과를 얻는다. `reward_value`는 그 풀의 평균 시세로, EV 계산에만 쓰이고 실제 지급액을 보장하지는 않는다.
 
 **POST /admin/cosmetic-items — 요청 예시**
 ```json
