@@ -277,9 +277,15 @@ sequenceDiagram
 ```
 
 ```json
-// Request
+// Request — 포인트로 뽑기
 POST /oripa-packs/42/draws
 Idempotency-Key: 7c1b6e2a-...
+{ }
+
+// Request — 무료 뽑기권으로 뽑기 (§6 이벤트 보상으로 지급된 티켓)
+POST /oripa-packs/42/draws
+Idempotency-Key: 9a1f4c3d-...
+{ "ticket_id": 5510 }
 
 // 200 Response
 {
@@ -294,11 +300,15 @@ Idempotency-Key: 7c1b6e2a-...
     "is_graded": false,
     "images": ["https://cdn.../photo1.webp"]
   },
+  "payment_method": "points",
   "points_spent": 3000,
-  "wallet_balance_after": 47000,
+  "bonus_spent": 500,
+  "wallet_balance_after": { "paid": 46500, "bonus": 0 },
   "remaining_slots": 36
 }
 ```
+- `ticket_id` 생략 시 포인트 차감(무상 적립금 우선 소진 후 유상 잔액, §ERD.md §7), `ticket_id` 지정 시 해당 `free_draw_tickets`를 소비하고 포인트 차감 없음(`payment_method: "free_ticket"`).
+- `ticket_id`가 지정한 `pack_scope`와 대상 팩이 맞지 않으면 `422 TICKET_SCOPE_MISMATCH`, 이미 사용/만료된 티켓이면 `409 TICKET_NOT_AVAILABLE`.
 - 실패: `409 PACK_SOLD_OUT`, `402 INSUFFICIENT_BALANCE`, `423 PACK_LOCKED`(락 획득 실패, 재시도 유도).
 
 **GET /oripa-packs/{id}/proof — sold_out 이전/이후**
@@ -406,22 +416,36 @@ Idempotency-Key: 7c1b6e2a-...
 
 | Method | Path | Auth | 설명 |
 |---|---|---|---|
-| GET | `/users/me/wallet` | Bearer | 포인트 잔액 조회 |
+| GET | `/users/me/wallet` | Bearer | 포인트 잔액 조회 (유상/무상 분리) |
 | POST | `/wallet/charges` | Bearer + Idempotency-Key | 결제 요청 생성 (PG 리다이렉트/승인용 정보 반환) |
 | POST | `/webhooks/payments/{provider}` | 서명 검증(HMAC) | PG 웹훅 콜백 (`provider`: portone 경유가 기본, sub_pg로 실제 PG 구분) — server-to-server |
 | GET | `/users/me/ledger` | Bearer | 포인트 증감 원장 이력 |
+| GET | `/users/me/bonus-credits` | Bearer | 보유 중인 무상 적립금 내역 (출처별, 만료일 포함) |
+| GET | `/charge-bonus-rules/active` | - | 현재 활성화된 충전 수단별 보너스 규칙 조회 (충전 화면 안내용) |
+
+**GET /charge-bonus-rules/active — 응답 예시 (계좌이체 유도)**
+```json
+{
+  "rules": [
+    { "method": "transfer", "bonus_rate": 0.03, "min_charge_amount": 10000, "max_bonus_amount": 5000, "description": "계좌이체 충전 시 3% 추가 적립 (최대 5,000P)" },
+    { "method": "card", "bonus_rate": 0, "min_charge_amount": 0, "max_bonus_amount": 0, "description": null }
+  ]
+}
+```
+- 충전 화면에서 이 API로 수단별 보너스율을 안내해 계좌이체 선택을 유도한다 — 계좌이체 PG 수수료(약 1.8%)가 카드(3.4%+)보다 낮아(§5.1) 절감분 일부를 즉시 무상 적립금으로 되돌려주는 구조.
 
 **POST /wallet/charges — 요청/응답 예시**
 ```json
 // Request
-{ "amount": 50000, "method": "card", "pg_provider": "portone", "sub_pg": "nhn_kcp" }
+{ "amount": 50000, "method": "transfer", "pg_provider": "portone", "sub_pg": "nhn_kcp" }
 
 // 200 Response
 {
   "payment_transaction_id": 33012,
   "status": "pending",
   "pg_checkout_url": "https://checkout.portone.io/...",
-  "amount": 50000
+  "amount": 50000,
+  "applicable_bonus": { "method": "transfer", "bonus_rate": 0.03, "estimated_bonus_amount": 1500 }
 }
 ```
 - `pg_provider`는 항상 `portone`(통합 게이트웨이), `sub_pg`로 실제 카드사 라우팅 PG(`nhn_kcp`, `kg_inicis`, `toss`, `kakaopay` 등)를 지정 — 특정 PG 장애/정책 변경 시 코드 변경 없이 `sub_pg` 라우팅만 교체 가능.
@@ -430,22 +454,46 @@ Idempotency-Key: 7c1b6e2a-...
 1. `X-Signature` 헤더를 PG 공개 검증 규칙(HMAC-SHA256)으로 재계산 후 대조 — 불일치 시 `401` 즉시 반환.
 2. `payment_transactions.pg_tid` 존재 여부로 중복 웹훅 무시(이미 `approved`면 `200 OK`만 반환, 재처리 없음).
 3. 서버측 금액 재검증: 웹훅 `amount`가 원 요청 `payment_transactions.amount`와 다르면 `422 AMOUNT_MISMATCH` 처리 후 관리자 알림.
-4. 승인 확정 시 트랜잭션: `payment_transactions.status='approved'` + `ledger_entries` INSERT(`charge`, `idempotency_key = pg_tid`) + `wallets.balance` 갱신을 단일 DB 트랜잭션으로 커밋.
+4. 승인 확정 시 트랜잭션(단일 DB 트랜잭션): `payment_transactions.status='approved'` + `ledger_entries` INSERT(`charge`, `balance_type=paid`, `idempotency_key=pg_tid`) + `wallets.paid_balance` 갱신 + (활성 `charge_bonus_rules` 매칭 시) `bonus_credit_grants` INSERT + `ledger_entries` INSERT(`bonus_grant`, `balance_type=bonus`) + `wallets.bonus_balance` 갱신.
 
 ```json
 // 200 Response (조회용)
 GET /users/me/wallet
-{ "balance": 47000, "updated_at": "2026-07-17T09:55:00Z" }
+{
+  "paid_balance": 46500,
+  "bonus_balance": 2000,
+  "total_balance": 48500,
+  "updated_at": "2026-07-17T09:55:00Z"
+}
+```
+
+**GET /users/me/bonus-credits — 응답 예시**
+```json
+{
+  "data": [
+    { "id": 881, "source_type": "transfer_bonus", "amount": 1500, "remaining_amount": 1500, "expires_at": "2026-10-17T00:00:00Z" },
+    { "id": 879, "source_type": "attendance", "amount": 500, "remaining_amount": 0, "expires_at": "2026-08-15T00:00:00Z" }
+  ]
+}
 ```
 
 ---
 
 ## 6. Event Service
 
+출석/미션/시즌패스/로열티 등급/추천인 등 리텐션 기능. 보상은 대부분 무상 적립금(`bonus_credit_grants`) 또는 무료 뽑기권(`free_draw_tickets`)으로 지급되며 §5/§7의 지갑 구조를 그대로 사용한다.
+
 | Method | Path | Auth | 설명 |
 |---|---|---|---|
-| POST | `/events/attendance/check-in` | Bearer | 당일 출석 체크 (1일 1회) |
-| GET | `/events/attendance/status` | Bearer | 연속 출석 현황 |
+| POST | `/events/attendance/check-in` | Bearer | 당일 출석 체크 (1일 1회), 캘린더 순번 보상 지급 |
+| GET | `/events/attendance/status` | Bearer | 연속 출석 현황 + 캘린더 진행도 |
+| GET | `/missions` | Bearer | 진행 가능한 미션 목록과 내 진행도 |
+| POST | `/missions/{id}/claim` | Bearer | 완료된 미션 보상 수령 |
+| GET | `/season-pass/current` | Bearer | 현재 시즌패스 진행 상태 (XP, 레벨, 트랙별 보상 수령 여부) |
+| POST | `/season-pass/premium/purchase` | Bearer + Idempotency-Key | 프리미엄 트랙 구매 (포인트 차감) |
+| POST | `/season-pass/rewards/{level}/claim` | Bearer | 레벨 보상 수령 (`?track=free\|premium`) |
+| GET | `/users/me/loyalty` | Bearer | 내 로열티 등급, 누적 충전액, 다음 등급까지 남은 금액 |
+| GET | `/users/me/draw-tickets` | Bearer | 보유 무료 뽑기권 목록 |
 | POST | `/coupons/redeem` | Bearer | 쿠폰 코드 등록 |
 | GET | `/rankings` | - | 랭킹 조회 (`?period=weekly`) |
 | POST | `/referrals/invite` | Bearer | 초대 코드 발급/조회 |
@@ -453,9 +501,75 @@ GET /users/me/wallet
 
 **POST /events/attendance/check-in — 응답 예시**
 ```json
-{ "streak_count": 5, "reward_points": 100, "wallet_balance_after": 47100 }
+{
+  "streak_count": 5,
+  "calendar_day_number": 5,
+  "reward_type": "bonus_credit",
+  "reward_value": 100,
+  "wallet_balance_after": { "paid": 46500, "bonus": 2100 }
+}
 ```
-- 중복 체크인 시 `409 ALREADY_CHECKED_IN`.
+- 중복 체크인 시 `409 ALREADY_CHECKED_IN`. 캘린더 마지막 날(예: 7일차·30일차)은 `reward_type=free_draw_ticket`으로 무료 뽑기권을 지급하도록 관리자가 구성 가능(§ERD.md §8 `attendance_calendar_configs`).
+
+**GET /missions — 응답 예시**
+```json
+{
+  "data": [
+    { "id": 12, "code": "daily_first_draw", "name": "오늘 첫 뽑기", "progress_count": 0, "target_count": 1, "status": "in_progress", "reward_type": "bonus_credit", "reward_value": 300 },
+    { "id": 15, "code": "n_draws_in_day_3", "name": "오늘 3회 뽑기", "progress_count": 3, "target_count": 3, "status": "completed", "reward_type": "free_draw_ticket", "reward_value": 1 }
+  ]
+}
+```
+
+**POST /missions/{id}/claim — 응답 예시**
+```json
+{ "mission_id": 15, "status": "reward_claimed", "granted": { "type": "free_draw_ticket", "ticket_id": 5510, "expires_at": "2026-08-01T00:00:00Z" } }
+```
+- 미완료 상태에서 청구 시 `409 MISSION_NOT_COMPLETED`, 이미 청구했으면 `409 REWARD_ALREADY_CLAIMED`.
+
+**GET /season-pass/current — 응답 예시**
+```json
+{
+  "season_pass_id": 3,
+  "name": "2026 서머 시즌패스",
+  "xp": 4200,
+  "current_level": 14,
+  "premium_purchased": false,
+  "next_level_xp": 4500,
+  "rewards_preview": [
+    { "level": 15, "track": "free", "reward_type": "bonus_credit", "reward_value": 200, "claimable": false },
+    { "level": 15, "track": "premium", "reward_type": "free_draw_ticket", "reward_value": 1, "claimable": false, "locked_reason": "premium_not_purchased" }
+  ]
+}
+```
+
+**POST /season-pass/premium/purchase — 요청/응답 예시**
+```json
+// Request
+{ }
+// 200 Response
+{ "premium_purchased": true, "amount_charged": 9900, "wallet_balance_after": { "paid": 36600, "bonus": 2100 } }
+```
+- 실패: `409 SEASON_PASS_ALREADY_PURCHASED`, `402 INSUFFICIENT_BALANCE`.
+
+**POST /season-pass/rewards/{level}/claim — 실패 케이스**
+- 프리미엄 트랙 미구매 상태에서 청구 시 `403 SEASON_PASS_PREMIUM_REQUIRED`, 아직 도달하지 않은 레벨이면 `409 LEVEL_NOT_REACHED`.
+
+**GET /users/me/loyalty — 응답 예시**
+```json
+{
+  "tier_code": "gold",
+  "cumulative_charge_amount": 1250000,
+  "next_tier": { "tier_code": "vip", "min_cumulative_charge": 3000000, "remaining_amount": 1750000 },
+  "benefits": { "shipping_discount_rate": 0.5, "vip_only_packs": true }
+}
+```
+- `cumulative_charge_amount`는 유상 충전액 기준(§ERD.md §7·§8) — 환불된 금액은 차감되어 등급이 강등될 수 있음.
+
+**GET /users/me/draw-tickets — 응답 예시**
+```json
+{ "data": [ { "id": 5510, "source_type": "mission", "pack_scope": "any", "status": "available", "expires_at": "2026-08-01T00:00:00Z" } ] }
+```
 
 **POST /coupons/redeem — 응답 예시**
 ```json
@@ -463,8 +577,9 @@ GET /users/me/wallet
 { "code": "WELCOME2026" }
 
 // 200 Response
-{ "coupon_type": "fixed_points", "value": 3000, "wallet_balance_after": 50100 }
+{ "coupon_type": "fixed_points", "value": 3000, "wallet_balance_after": { "paid": 46500, "bonus": 5100 } }
 ```
+- 쿠폰 지급분은 `bonus_credit_grants`(`source_type=coupon`)로 적립되어 무상 적립금 취급(환불 대상 아님).
 - 실패: `404 COUPON_NOT_FOUND`, `409 COUPON_ALREADY_REDEEMED`, `410 COUPON_EXPIRED`.
 
 ---
@@ -570,6 +685,33 @@ GET /users/me/wallet
 | POST | `/admin/settlement-holds/{id}/release` | 정산 보류 수동 해제 (예외 처리용) |
 | GET | `/admin/delivery-disputes?status=open` | 배송 이의제기 대기열 |
 | POST | `/admin/delivery-disputes/{id}/resolve` | 분쟁 처리 (재배송/환급/무과실/위탁자 귀책) |
+
+### 7.7 리텐션/유인 정책 관리
+| Method | Path | 설명 |
+|---|---|---|
+| POST | `/admin/charge-bonus-rules` | 충전수단별 보너스 규칙 생성/수정 (계좌이체 유도용) |
+| PATCH | `/admin/charge-bonus-rules/{id}` | 규칙 활성화/비활성화, 요율 변경 |
+| POST | `/admin/attendance-calendar-configs` | 출석 캘린더 N일차 보상 구성 |
+| POST | `/admin/mission-definitions` | 미션 템플릿 생성 (트리거/보상 정의) |
+| PATCH | `/admin/mission-definitions/{id}` | 미션 활성화/비활성화, 보상 변경 |
+| POST | `/admin/season-passes` | 시즌패스 생성 (시즌 기간, 프리미엄 가격, 최대 레벨) |
+| POST | `/admin/season-passes/{id}/rewards` | 레벨별 무료/프리미엄 트랙 보상 등록 |
+| POST | `/admin/loyalty-tiers` | 로열티 등급(누적 충전 기준) 생성/수정 |
+| POST | `/admin/draw-tickets/grant` | 특정 유저에게 무료 뽑기권 수동 지급 (CS 보상용) |
+
+**POST /admin/charge-bonus-rules — 요청 예시**
+```json
+{
+  "method": "transfer",
+  "bonus_rate": 0.03,
+  "min_charge_amount": 10000,
+  "max_bonus_amount": 5000,
+  "valid_from": "2026-08-01T00:00:00Z",
+  "valid_to": "2026-08-31T23:59:59Z",
+  "is_active": true
+}
+```
+- 카드 결제 대비 계좌이체의 PG 수수료 절감분(§5.1)을 재원으로 하므로, `bonus_rate`는 절감폭 이내로 설정해 마진을 해치지 않도록 관리자가 직접 통제한다.
 
 ---
 
@@ -691,3 +833,10 @@ sequenceDiagram
 | 409 | `DISPUTE_ALREADY_OPEN` | 이미 열린 이의제기가 있는 배송 건에 중복 제기 |
 | 410 | `INSPECTION_WINDOW_EXPIRED` | 검수 기간 경과 후 이의제기 시도 (자동 확정된 건) |
 | 409 | `CONSIGNMENT_NOT_APPROVED` | 심사 승인 전 위탁 카드가 팩에 배치되려는 시도 |
+| 409 | `TICKET_NOT_AVAILABLE` | 이미 사용/만료된 무료 뽑기권으로 뽑기 시도 |
+| 422 | `TICKET_SCOPE_MISMATCH` | 무료 뽑기권의 `pack_scope`와 대상 팩 불일치 |
+| 409 | `MISSION_NOT_COMPLETED` | 미완료 미션 보상 청구 시도 |
+| 409 | `REWARD_ALREADY_CLAIMED` | 이미 수령한 보상 재청구 시도 |
+| 409 | `SEASON_PASS_ALREADY_PURCHASED` | 이미 구매한 시즌패스 프리미엄 재구매 시도 |
+| 403 | `SEASON_PASS_PREMIUM_REQUIRED` | 프리미엄 미구매 상태에서 프리미엄 트랙 보상 청구 |
+| 409 | `LEVEL_NOT_REACHED` | 아직 도달하지 않은 시즌패스 레벨 보상 청구 |

@@ -308,9 +308,11 @@ erDiagram
         bigint user_id FK
         bigint pack_id FK
         bigint slot_id FK UK
-        numeric points_spent
+        varchar payment_method "points, free_ticket"
+        numeric points_spent "payment_method=points일 때만"
+        bigint free_draw_ticket_id FK "payment_method=free_ticket일 때만, §8 참조"
         varchar random_proof "CSPRNG 선택 인덱스 + 잔여슬롯수, 감사용"
-        varchar ledger_entry_ref FK "ledger_entries.id"
+        varchar ledger_entry_ref FK "ledger_entries.id, nullable(무료뽑기권 소비 시)"
         timestamptz drawn_at
     }
 ```
@@ -320,6 +322,7 @@ erDiagram
 2. **소비**: 개별 뽑기는 `SELECT ... FOR UPDATE SKIP LOCKED` + Redis 분산 락(`pack:{id}:lock`)으로 동시성 제어 후, 잔여 `available` 슬롯 중 `secrets.randbelow(remaining_count)`로 균등 추출 → 오버셀·중복 뽑기 불가.
 3. **리빌(Reveal)**: `status = settled` 전환 시 `server_seed` 공개 → 누구나 최초 커밋 해시와 대조해 매핑 조작 여부 검증 가능 (API: `GET /oripa-packs/{id}/proof`).
 4. `draw_logs`는 append-only(UPDATE/DELETE 금지, DB 권한으로 강제) 감사 로그.
+5. `payment_method=free_ticket`인 뽑기는 `free_draw_tickets.status`를 `used`로 전환하고 포인트 차감이 없다(§8 이벤트 보상 연동).
 
 ---
 
@@ -400,28 +403,59 @@ erDiagram
 
 ## 7. Payment & Wallet (복식 원장)
 
+포인트는 **유상(paid) / 무상(bonus)** 두 버킷으로 분리한다. 유상 잔액은 실제 충전한 돈이라 전자상거래법상 청약철회·환불
+대상이지만, 무상 적립금(출석/미션/이벤트/계좌이체 보너스 등으로 지급)은 환불 대상이 아니며 만료가 있다 — 이 구분이 없으면
+"이벤트로 받은 적립금까지 현금 환불해줘야 하는" 법적 리스크가 생긴다.
+
 ```mermaid
 erDiagram
     USERS ||--|| WALLETS : owns
     WALLETS ||--o{ LEDGER_ENTRIES : records
+    WALLETS ||--o{ BONUS_CREDIT_GRANTS : "accrues"
     USERS ||--o{ PAYMENT_TRANSACTIONS : makes
+    PAYMENT_TRANSACTIONS ||--o| CHARGE_BONUS_RULES : "may apply"
 
     WALLETS {
         bigint id PK
         bigint user_id FK UK
-        numeric balance "파생 캐시, 진실공급원=ledger_entries"
+        numeric paid_balance "유상 잔액(충전액), 환불 대상, 파생 캐시"
+        numeric bonus_balance "무상 적립금, 환불 불가, 파생 캐시"
         timestamptz updated_at
     }
 
     LEDGER_ENTRIES {
         bigint id PK
         bigint wallet_id FK
-        varchar entry_type "charge, draw_spend, refund_credit, event_bonus, adjustment, withdrawal"
+        varchar entry_type "charge, draw_spend, refund_credit, bonus_grant, bonus_expired, adjustment, withdrawal"
+        varchar balance_type "paid, bonus — 어느 버킷에 영향을 주는지"
         numeric amount "부호: +적립 / -차감"
         numeric balance_after
-        varchar ref_type "payment_transaction, draw_log, refund_request, coupon_redemption"
+        varchar ref_type "payment_transaction, draw_log, refund_request, coupon_redemption, bonus_credit_grant"
         bigint ref_id
         varchar idempotency_key UK
+        timestamptz created_at
+    }
+
+    BONUS_CREDIT_GRANTS {
+        bigint id PK
+        bigint wallet_id FK
+        varchar source_type "attendance, mission, transfer_bonus, coupon, season_pass, admin_grant"
+        bigint source_ref_id
+        numeric amount
+        numeric remaining_amount "소진 추적, 뽑기 시 무상 우선 차감(FIFO by expires_at)"
+        timestamptz expires_at
+        timestamptz created_at
+    }
+
+    CHARGE_BONUS_RULES {
+        bigint id PK
+        varchar method "transfer, card, kakaopay, naverpay"
+        numeric bonus_rate "예: 0.03 = 충전액의 3% 적립"
+        numeric min_charge_amount
+        numeric max_bonus_amount "1회 최대 적립 한도"
+        timestamptz valid_from
+        timestamptz valid_to
+        boolean is_active
         timestamptz created_at
     }
 
@@ -434,6 +468,7 @@ erDiagram
         numeric amount
         varchar method "card, transfer, kakaopay, naverpay"
         varchar status "pending, approved, failed, cancelled"
+        bigint applied_bonus_rule_id FK
         jsonb webhook_payload
         timestamptz requested_at
         timestamptz approved_at
@@ -441,10 +476,13 @@ erDiagram
 ```
 
 **설계 포인트**
-- `wallets.balance`는 성능을 위한 캐시이며, 정합성 검증 배치가 주기적으로 `SUM(ledger_entries.amount) == wallets.balance`를 대조.
-- 모든 포인트 증감은 `ledger_entries` 삽입 + `wallets.balance` 갱신을 **하나의 DB 트랜잭션**으로 처리.
+- `wallets.paid_balance`/`bonus_balance`는 성능을 위한 캐시이며, 정합성 검증 배치가 주기적으로 `SUM(ledger_entries.amount) GROUP BY balance_type`과 대조.
+- 모든 포인트 증감은 `ledger_entries` 삽입 + `wallets` 갱신을 **하나의 DB 트랜잭션**으로 처리.
 - `idempotency_key` UNIQUE 제약으로 PG 웹훅 재전송/중복 충전 요청을 DB 레벨에서 차단.
 - `payment_transactions.pg_tid` UNIQUE로 동일 PG 거래 중복 승인 방지.
+- **계좌이체 유도**: `charge_bonus_rules`에 `method=transfer` 규칙을 활성화하면, 계좌이체 충전 승인 시 `bonus_rate`만큼 `bonus_credit_grants`(`source_type=transfer_bonus`)가 자동 지급된다. 계좌이체 PG 수수료(약 1.8%)가 카드(3.4%+)보다 낮으므로(§API_SPEC §5.1), 절감분 일부를 즉시 무상 적립금으로 돌려주는 구조 — 환불 시에는 이 무상분은 회수되고 유상 충전액만 환불된다.
+- **소진 우선순위**: 뽑기(`draw_spend`) 시 `bonus_balance`를 먼저 차감(만료 임박한 `bonus_credit_grants`부터 FIFO)하고, 소진되면 `paid_balance`를 차감 — 유저 입장엔 무상 적립금이 먼저 없어지는 게 유리하고, 플랫폼 입장엔 환불 의무가 있는 유상 잔액을 최대한 보존할 수 있다.
+- `bonus_credit_grants.expires_at` 경과분은 배치가 `remaining_amount`를 0으로 만들며 `ledger_entries`에 `bonus_expired` 기록.
 
 ---
 
@@ -453,18 +491,38 @@ erDiagram
 ```mermaid
 erDiagram
     USERS ||--o{ ATTENDANCE_LOGS : checks_in
+    ATTENDANCE_CALENDAR_CONFIGS ||--o{ ATTENDANCE_LOGS : "rewards via"
     USERS ||--o{ COUPON_REDEMPTIONS : redeems
     COUPONS ||--o{ COUPON_REDEMPTIONS : "redeemed by"
     USERS ||--o{ REFERRALS : refers
     USERS ||--o{ RANKING_SNAPSHOTS : ranked
+    USERS ||--o{ USER_MISSIONS : progresses
+    MISSION_DEFINITIONS ||--o{ USER_MISSIONS : defines
+    USERS ||--|| USER_LOYALTY_STATUS : has
+    LOYALTY_TIERS ||--o{ USER_LOYALTY_STATUS : "achieved by"
+    USERS ||--o{ USER_SEASON_PASSES : owns
+    SEASON_PASSES ||--o{ USER_SEASON_PASSES : "played by"
+    SEASON_PASSES ||--o{ SEASON_PASS_REWARDS : defines
+    USER_SEASON_PASSES ||--o{ USER_SEASON_PASS_CLAIMS : claims
+    USERS ||--o{ FREE_DRAW_TICKETS : holds
 
     ATTENDANCE_LOGS {
         bigint id PK
         bigint user_id FK
         date check_in_date UK "user_id+date 복합 UNIQUE"
         int streak_count
+        int calendar_day_number "캘린더 순환 몇 일차 보상을 받았는지"
         numeric reward_points
         timestamptz created_at
+    }
+
+    ATTENDANCE_CALENDAR_CONFIGS {
+        bigint id PK
+        int day_number "1~N, 연속출석 순환 주기 내 순번"
+        varchar reward_type "bonus_credit, free_draw_ticket"
+        numeric reward_value
+        varchar description
+        boolean is_active
     }
 
     COUPONS {
@@ -504,11 +562,103 @@ erDiagram
         int rank
         timestamptz computed_at
     }
+
+    MISSION_DEFINITIONS {
+        bigint id PK
+        varchar code UK
+        varchar name
+        varchar trigger_type "first_charge, first_draw, daily_login, n_draws_in_day, invite_friend, transfer_charge"
+        int target_count "예: n_draws_in_day=3"
+        varchar reward_type "bonus_credit, free_draw_ticket"
+        numeric reward_value
+        timestamptz valid_from
+        timestamptz valid_to
+        boolean is_active
+    }
+
+    USER_MISSIONS {
+        bigint id PK
+        bigint user_id FK
+        bigint mission_id FK
+        int progress_count
+        varchar status "in_progress, completed, reward_claimed"
+        timestamptz completed_at
+        timestamptz reward_claimed_at
+    }
+
+    LOYALTY_TIERS {
+        bigint id PK
+        varchar tier_code "bronze, silver, gold, vip"
+        numeric min_cumulative_charge "누적 유상 충전액 기준"
+        jsonb benefits "배송비 할인율, 전용 이벤트, 등급전용 팩 접근 등"
+    }
+
+    USER_LOYALTY_STATUS {
+        bigint id PK
+        bigint user_id FK UK
+        bigint tier_id FK
+        numeric cumulative_charge_amount
+        timestamptz tier_achieved_at
+        timestamptz updated_at
+    }
+
+    SEASON_PASSES {
+        bigint id PK
+        varchar name
+        date season_start
+        date season_end
+        numeric premium_price
+        int max_level
+        boolean is_active
+    }
+
+    SEASON_PASS_REWARDS {
+        bigint id PK
+        bigint season_pass_id FK
+        int level
+        varchar track "free, premium"
+        varchar reward_type "bonus_credit, free_draw_ticket"
+        numeric reward_value
+    }
+
+    USER_SEASON_PASSES {
+        bigint id PK
+        bigint user_id FK
+        bigint season_pass_id FK
+        int xp
+        int current_level
+        boolean premium_purchased
+        timestamptz purchased_at
+    }
+
+    USER_SEASON_PASS_CLAIMS {
+        bigint id PK
+        bigint user_season_pass_id FK
+        int level
+        varchar track "free, premium"
+        timestamptz claimed_at
+    }
+
+    FREE_DRAW_TICKETS {
+        bigint id PK
+        bigint user_id FK
+        varchar source_type "attendance, mission, season_pass, coupon, admin_grant"
+        bigint source_ref_id
+        varchar pack_scope "any, game:pokemon, pack:{id} — 사용 가능 범위"
+        varchar status "available, used, expired"
+        timestamptz expires_at
+        timestamptz used_at
+        timestamptz created_at
+    }
 ```
 
 **설계 포인트**
-- `attendance_logs`는 `(user_id, check_in_date)` UNIQUE로 하루 중복 출석 방지, `streak_count`는 전일 미출석 시 배치/트리거로 리셋.
+- `attendance_logs`는 `(user_id, check_in_date)` UNIQUE로 하루 중복 출석 방지, `streak_count`는 전일 미출석 시 배치/트리거로 리셋. `attendance_calendar_configs`로 관리자가 "N일차 보상"을 자유롭게 구성(예: 7일차 무료뽑기권, 30일차 대량 적립금).
 - `ranking_snapshots`는 실시간 집계 대신 주기적 배치 스냅샷(랭킹 조작·부하 방지), 실시간 뽑기 피드는 별도 WebSocket 채널(§API 명세 참고)로 처리하며 영속 저장하지 않음.
+- **미션 시스템**: `mission_definitions`는 관리자가 트리거 조건과 보상을 정의하는 템플릿, `user_missions`가 유저별 진행도를 추적. 뽑기/충전/친구초대 등 이벤트 발생 시 해당 유저의 `user_missions.progress_count`를 증가시키고 `target_count` 도달 시 `completed`로 전환(보상은 별도 청구 API로 명시적 수령 — 자동 지급하지 않아 "받았는지 모르고 방치" 방지 및 UX 상 보상 연출 여지 확보).
+- **시즌패스**: `season_pass_rewards`로 무료(free)/프리미엄(premium) 두 트랙 보상을 레벨별로 정의, `user_season_passes.xp`는 뽑기·충전·미션 완료 등으로 누적. 프리미엄 트랙은 `premium_purchased=true`인 유저만 청구 가능.
+- **로열티 등급(VIP)**: `loyalty_tiers.min_cumulative_charge` 기준으로 `user_loyalty_status.tier_id`가 배치/트리거로 자동 갱신 — 누적 충전액은 **유상 충전액 기준**(§7 `paid_balance` 흐름과 연동, 환불된 금액은 누적에서 차감)이라 무상 적립금으로 등급을 올릴 수 없다.
+- **무료 뽑기권**: `free_draw_tickets`는 출석/미션/시즌패스/쿠폰으로 지급되는 "뽑기 1회 무료" 아이템. `pack_scope`로 특정 게임/팩에만 쓰게 제한 가능. 뽑기 API(`POST /oripa-packs/{id}/draws`)가 `ticket_id`를 받으면 포인트 차감 대신 이 티켓을 소비 — 상세는 API_SPEC.md §3, §6 참고.
 
 ---
 
@@ -739,6 +889,9 @@ erDiagram
 - `draw_logs`, `audit_logs`: `created_at` BRIN 인덱스(append-only 대용량 로그).
 - `settlement_holds`: `physical_card_id` UNIQUE, `(status, hold_expires_at)` 부분 인덱스(`WHERE status='held'`) — 검수기한 만료 배치 스캔용.
 - `consignor_ledger_entries`: `(consignor_id, created_at)` 복합 인덱스.
+- `bonus_credit_grants`: `(wallet_id, expires_at)` 부분 인덱스(`WHERE remaining_amount > 0`) — 만료 배치/FIFO 소진 스캔용.
+- `user_missions`: `(user_id, mission_id)` UNIQUE.
+- `free_draw_tickets`: `(user_id, status)` 부분 인덱스(`WHERE status='available'`), `expires_at` 만료 배치용.
 
 ### 12.3 동시성 & 정합성 강제 요약
 
@@ -747,7 +900,10 @@ erDiagram
 | 슬롯:실물 1:1 | `oripa_slots.physical_card_id` UNIQUE |
 | 동일 슬롯 중복 뽑기 방지 | `SELECT FOR UPDATE SKIP LOCKED` + Redis 분산 락 + `draw_logs.slot_id` UNIQUE |
 | 중복 충전/웹훅 재처리 방지 | `payment_transactions.pg_tid` UNIQUE, `ledger_entries.idempotency_key` UNIQUE |
-| 포인트 잔액 위변조 방지 | `wallets.balance`는 트리거로만 갱신, 애플리케이션 직접 UPDATE 금지(뷰/함수 경유) |
+| 포인트 잔액 위변조 방지 | `wallets.paid_balance`/`bonus_balance`는 트리거로만 갱신, 애플리케이션 직접 UPDATE 금지(뷰/함수 경유) |
+| 무상 적립금 현금 환불 방지 | 환불(`refund_credit`)은 `balance_type='paid'` 항목에서만 계산, 환불 시 `bonus_balance`는 대상에서 제외 |
+| 무료 뽑기권 중복 사용 방지 | `free_draw_tickets.status`는 상태머신(`available→used`)으로만 전이, `draw_logs.free_draw_ticket_id` UNIQUE |
+| 동일 미션 중복 완료 처리 방지 | `user_missions.(user_id, mission_id)` UNIQUE |
 | 감사 로그 불변성 | `draw_logs`, `audit_logs`, `user_change_logs`에 UPDATE/DELETE 권한 미부여 (append-only role) |
 | 동일 SNS 계정 중복 가입 방지 | `user_oauth_accounts.(provider, provider_user_id)` UNIQUE |
 | 인증 코드 재사용/무한 시도 방지 | `verification_codes.attempt_count` 임계치 초과 시 코드 폐기, `expires_at` 경과 시 무효 |
