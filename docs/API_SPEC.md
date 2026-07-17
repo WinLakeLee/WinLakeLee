@@ -14,8 +14,9 @@
 6. [Event Service](#6-event-service)
 7. [Admin Service](#7-admin-service)
 8. [Consignment & Settlement Service](#8-consignment--settlement-service)
-9. [WebSocket — 실시간 뽑기 피드](#9-websocket--실시간-뽑기-피드)
-10. [에러 코드 표준](#10-에러-코드-표준)
+9. [Offline Store Check-in Service](#9-offline-store-check-in-service)
+10. [WebSocket — 실시간 뽑기 피드](#10-websocket--실시간-뽑기-피드)
+11. [에러 코드 표준](#11-에러-코드-표준)
 
 ---
 
@@ -680,6 +681,34 @@ GET /users/me/wallet
 ```
 - 카드 결제 대비 계좌이체의 PG 수수료 절감분(§5.1)을 재원으로 하므로, `bonus_rate`는 절감폭 이내로 설정해 마진을 해치지 않도록 관리자가 직접 통제한다.
 
+### 7.8 오프라인 매장 체크인 관리
+| Method | Path | 설명 |
+|---|---|---|
+| POST | `/admin/partner-stores` | 제휴 매장 등록 (위치, geofence 반경, QR 시크릿) — `status=pending`으로 생성 |
+| PATCH | `/admin/partner-stores/{id}` | 매장 승인(`status=active`)/정지, 반경·QR 시크릿 갱신 |
+| POST | `/admin/partner-stores/{id}/qr-issuances` | (매장 태블릿 전용 인증) 회전 QR 신규 발급 — 60초 주기로 태블릿이 자동 호출 |
+| POST | `/admin/offline-checkin-rules` | 일/주 한도, 보상액, 무료누적상한(`lifetime_free_cap_without_paid_charge`) 설정 |
+| GET | `/admin/offline-checkin-fraud-flags?status=open` | 이상탐지 대기열 (이동불가/기기공유/매장이상) |
+| POST | `/admin/offline-checkin-fraud-flags/{id}/resolve` | 이상거래 확정(적립금 회수)/오탐 해제 |
+
+**POST /admin/offline-checkin-rules — 요청 예시**
+```json
+{
+  "daily_limit_per_user": 1,
+  "weekly_limit_per_user": 3,
+  "reward_amount": 300,
+  "cooldown_minutes": 180,
+  "lifetime_free_cap_without_paid_charge": 3000,
+  "is_active": true
+}
+```
+
+**POST /admin/offline-checkin-fraud-flags/{id}/resolve — 요청 예시**
+```json
+{ "resolution": "confirmed_fraud", "action": "revoke_bonus_and_suspend_checkin", "note": "동일 기기로 5개 계정 체크인 확인" }
+```
+- `confirmed_fraud` 처리 시 해당 체크인으로 지급된 `bonus_credit_grants`를 회수(음수 조정 항목 삽입)하고, 필요 시 해당 유저의 오프라인 체크인 기능 자체를 정지할 수 있다.
+
 ---
 
 ## 8. Consignment & Settlement Service
@@ -752,7 +781,93 @@ sequenceDiagram
 
 ---
 
-## 9. WebSocket — 실시간 뽑기 피드
+## 9. Offline Store Check-in Service
+
+제휴 오프라인 카드샵 방문 인증 & 보상 지급. 데이터 모델은 `docs/ERD.md` §12 참고 — 매장이 60초 주기로 발급받는 회전
+QR("장부 1")과 고객이 스캔해 제출하는 기록("장부 2")을 서버가 대조해야만 보상이 나가는 이중 검증 구조다.
+
+| Method | Path | Auth | 설명 |
+|---|---|---|---|
+| GET | `/partner-stores/nearby` | Bearer | 현재 위치 기준 근처 제휴 매장 목록 (`?lat=&lng=&radius_km=`) |
+| POST | `/partner-stores/{id}/checkin` | Bearer | 매장 방문 체크인 (QR 토큰 + GPS + 디바이스 무결성 증명 제출) |
+| GET | `/users/me/offline-checkins` | Bearer | 내 오프라인 체크인 이력 |
+| GET | `/offline-checkin-rules/active` | - | 현재 활성 체크인 보상 규칙(일/주 한도, 보상액) 조회 |
+
+**매장 QR 발급 → 고객 체크인 → 보상 지급 흐름**
+```mermaid
+sequenceDiagram
+    participant Tablet as 매장 태블릿
+    participant API as Offline Checkin API
+    participant App as 고객 앱
+    participant DB as PostgreSQL
+    participant Fraud as 이상탐지(Celery, 비동기)
+
+    loop 60초마다
+        Tablet->>API: 매장 전용 인증으로 신규 QR 요청
+        API->>DB: store_qr_issuances INSERT (issued_at, expires_at) — 장부 1
+        API-->>Tablet: qr_token → 화면에 QR 이미지로 표시
+    end
+    App->>Tablet: (고객이 화면의 QR 스캔)
+    App->>API: POST /partner-stores/{id}/checkin { qr_token, lat, lng, device_attestation }
+    API->>DB: qr_issuance 존재/미만료/미소비 확인 + geofence 거리 계산 + 디바이스 무결성 검증
+    API->>DB: store_checkins INSERT(status=verified 또는 flagged) — 장부 2
+    alt 검증 통과 & 일/주 한도 이내 & 무료누적상한 이내
+        API->>DB: bonus_credit_grants INSERT(source_type=offline_checkin) + wallets.bonus_balance 갱신
+        API-->>App: 200 { reward_granted: true, bonus_amount }
+    else 한도초과/상한도달/검증실패
+        API-->>App: 4xx 에러 (보상 없음)
+    end
+    API--)Fraud: 비동기 이상탐지 트리거
+    Fraud->>DB: impossible_travel / device_multi_account / shop_anomaly 검사
+    Fraud->>DB: 의심 시 offline_checkin_fraud_flags INSERT, 지급 보류/회수 대상으로 표시
+```
+
+**POST /partner-stores/{id}/checkin — 요청/응답 예시**
+```json
+// Request
+{
+  "qr_token": "b91f...e02a",
+  "lat": 37.5012,
+  "lng": 127.0396,
+  "device_attestation": "eyJhbGciOi..."
+}
+
+// 200 Response — 검증 통과, 즉시 지급
+{
+  "checkin_id": 88213,
+  "status": "verified",
+  "reward_granted": true,
+  "bonus_amount": 300,
+  "wallet_balance_after": { "paid": 0, "bonus": 1800 },
+  "daily_remaining": 0,
+  "weekly_remaining": 2
+}
+
+// 202 Response — 이상탐지로 보류 (즉시 거부하지 않고 검토 대기)
+{
+  "checkin_id": 88214,
+  "status": "flagged",
+  "reward_granted": false,
+  "message": "검토 후 지급 여부가 결정됩니다."
+}
+```
+- `device_attestation`은 Android Play Integrity API / iOS DeviceCheck 토큰 — 서버가 각 플랫폼 검증 API로 재확인 후 위변조/모킹 의심 시 자동 `flagged` 처리.
+- 실패: `404 QR_TOKEN_NOT_FOUND`(만료/미존재), `409 QR_TOKEN_ALREADY_USED`, `422 OUT_OF_GEOFENCE`(매장 반경 밖), `403 DEVICE_INTEGRITY_FAILED`, `429 DAILY_CHECKIN_LIMIT_REACHED` / `429 WEEKLY_CHECKIN_LIMIT_REACHED`, `403 FREE_CREDIT_CAP_REACHED_REQUIRES_CHARGE`(유상 충전 이력 없이 무료 누적 상한 도달 — 최소 1회 충전 후 재시도 안내).
+
+**GET /offline-checkin-rules/active — 응답 예시**
+```json
+{
+  "daily_limit_per_user": 1,
+  "weekly_limit_per_user": 3,
+  "reward_amount": 300,
+  "cooldown_minutes": 180,
+  "lifetime_free_cap_without_paid_charge": 3000
+}
+```
+
+---
+
+## 10. WebSocket — 실시간 뽑기 피드
 
 `wss://api.<domain>/ws/feed`
 
@@ -774,7 +889,7 @@ sequenceDiagram
 
 ---
 
-## 10. 에러 코드 표준
+## 11. 에러 코드 표준
 
 | HTTP | code | 설명 |
 |---|---|---|
@@ -804,3 +919,9 @@ sequenceDiagram
 | 422 | `TICKET_SCOPE_MISMATCH` | 무료 뽑기권의 `pack_scope`와 대상 팩 불일치 |
 | 409 | `MISSION_NOT_COMPLETED` | 미완료 미션 보상 청구 시도 |
 | 409 | `REWARD_ALREADY_CLAIMED` | 이미 수령한 보상 재청구 시도 |
+| 404 | `QR_TOKEN_NOT_FOUND` | 오프라인 체크인 QR 토큰이 만료되었거나 존재하지 않음 |
+| 409 | `QR_TOKEN_ALREADY_USED` | 이미 소비된 QR 토큰 재사용 시도 (리플레이) |
+| 422 | `OUT_OF_GEOFENCE` | 제출된 GPS 좌표가 매장 반경 밖 |
+| 403 | `DEVICE_INTEGRITY_FAILED` | 디바이스 무결성 증명(Play Integrity/DeviceCheck) 검증 실패 |
+| 429 | `DAILY_CHECKIN_LIMIT_REACHED` / `WEEKLY_CHECKIN_LIMIT_REACHED` | 오프라인 체크인 일/주 한도 초과 |
+| 403 | `FREE_CREDIT_CAP_REACHED_REQUIRES_CHARGE` | 유상 충전 이력 없이 무료 적립금 누적 상한 도달 — 최소 1회 충전 필요 |

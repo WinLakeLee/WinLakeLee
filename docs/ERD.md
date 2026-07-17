@@ -18,7 +18,8 @@ GENERATED ALWAYS AS IDENTITY PK`, `created_at timestamptz DEFAULT now()`를 공�
 9. [Admin & Audit](#9-admin--audit)
 10. [Card Data Collection Pipeline (운영 데이터 수집)](#10-card-data-collection-pipeline-운영-데이터-수집)
 11. [Consignment & Marketplace Escrow (위탁 판매 & 정산 에스크로)](#11-consignment--marketplace-escrow-위탁-판매--정산-에스크로)
-12. [설계 노트](#12-설계-노트)
+12. [Offline Store Check-in & Anti-Farming (오프라인 매장 체크인 & 채굴 방지)](#12-offline-store-check-in--anti-farming-오프라인-매장-체크인--채굴-방지)
+13. [설계 노트](#13-설계-노트)
 
 ---
 
@@ -190,7 +191,7 @@ erDiagram
         varchar card_number
         varchar name
         varchar rarity
-        jsonb attributes "게임별 가변 속성, §12 참고"
+        jsonb attributes "게임별 가변 속성, §13 참고"
         varchar source "api_sync, crawl, manual"
         timestamptz synced_at
         timestamptz created_at
@@ -439,7 +440,7 @@ erDiagram
     BONUS_CREDIT_GRANTS {
         bigint id PK
         bigint wallet_id FK
-        varchar source_type "attendance, mission, transfer_bonus, coupon, admin_grant"
+        varchar source_type "attendance, mission, transfer_bonus, coupon, offline_checkin, admin_grant"
         bigint source_ref_id
         numeric amount
         numeric remaining_amount "소진 추적, 뽑기 시 무상 우선 차감(FIFO by expires_at)"
@@ -593,7 +594,8 @@ erDiagram
         bigint id PK
         bigint user_id FK UK
         bigint tier_id FK
-        numeric cumulative_charge_amount
+        numeric cumulative_charge_amount "누적 유상 충전액"
+        numeric cumulative_free_offline_bonus "오프라인 체크인으로 받은 무상 적립금 누적, §12 채굴방지 규칙에 사용"
         timestamptz tier_achieved_at
         timestamptz updated_at
     }
@@ -817,9 +819,97 @@ erDiagram
 
 ---
 
-## 12. 설계 노트
+## 12. Offline Store Check-in & Anti-Farming (오프라인 매장 체크인 & 채굴 방지)
 
-### 12.1 `cards.attributes` JSONB 스키마 예시 (게임별)
+제휴 오프라인 카드샵 방문 시 무상 적립금을 지급해 오프라인 매장 유입을 유도하는 기능. **매장 측 QR 발급 기록**과
+**고객 측 스캔 제출 기록**을 서로 다른 주체가 남기고 서버가 대조하는 이중 장부 구조로 실제 방문을 검증하며,
+"돈은 안 쓰고 무료 적립금만 계속 채굴"하는 어뷰징을 막기 위한 누적 상한을 둔다.
+
+```mermaid
+erDiagram
+    PARTNER_STORES ||--o{ STORE_QR_ISSUANCES : issues
+    PARTNER_STORES ||--o{ STORE_CHECKINS : "visited via"
+    STORE_QR_ISSUANCES ||--o| STORE_CHECKINS : "consumed by"
+    USERS ||--o{ STORE_CHECKINS : performs
+    STORE_CHECKINS ||--o{ OFFLINE_CHECKIN_FRAUD_FLAGS : "may flag"
+
+    PARTNER_STORES {
+        bigint id PK
+        varchar name
+        varchar address
+        numeric latitude
+        numeric longitude
+        int geofence_radius_m "매장 반경, 예: 50m"
+        varchar qr_secret_key "회전 QR 생성용 HMAC 시드"
+        varchar status "pending, active, suspended, terminated"
+        timestamptz created_at
+    }
+
+    STORE_QR_ISSUANCES {
+        bigint id PK
+        bigint store_id FK
+        varchar qr_token UK "매장 태블릿/PC 화면에 표시되는 회전 토큰 — '장부 1' (매장측 기록)"
+        timestamptz issued_at
+        timestamptz expires_at "issued_at + 60초 등 짧은 주기로 재발급"
+    }
+
+    STORE_CHECKINS {
+        bigint id PK
+        bigint user_id FK
+        bigint store_id FK
+        bigint qr_issuance_id FK UK "스캔한 토큰, 1회만 소비(replay 방지) — '장부 2' (고객측 기록)"
+        varchar device_id "디바이스 지문"
+        numeric client_lat
+        numeric client_lng
+        numeric distance_from_store_m
+        boolean device_integrity_verified "Android Play Integrity / iOS DeviceCheck 통과 여부"
+        varchar status "verified, rejected, flagged"
+        varchar rejected_reason
+        timestamptz created_at
+    }
+
+    OFFLINE_CHECKIN_REWARD_RULES {
+        bigint id PK
+        int daily_limit_per_user
+        int weekly_limit_per_user
+        numeric reward_amount
+        int cooldown_minutes "연속 체크인 간 최소 간격"
+        numeric lifetime_free_cap_without_paid_charge "유상 충전 이력 없는 유저의 누적 무료지급 상한 — 채굴 방지 핵심"
+        boolean is_active
+        timestamptz valid_from
+        timestamptz valid_to
+    }
+
+    OFFLINE_CHECKIN_FRAUD_FLAGS {
+        bigint id PK
+        bigint checkin_id FK
+        varchar flag_type "impossible_travel, device_multi_account, gps_mismatch, shop_anomaly"
+        jsonb detail "탐지 근거(이전 체크인과의 거리/시간, 동일 device_id 목록 등)"
+        varchar status "open, confirmed_fraud, cleared"
+        bigint reviewed_by FK
+        timestamptz reviewed_at
+        timestamptz created_at
+    }
+```
+
+**설계 포인트 — 이중 출석부(Dual-Ledger) 검증**
+1. 매장에 설치된 태블릿/PC가 60초 주기로 서버로부터 새 QR을 발급받아 화면에 표시 — 이 발급 자체가 `store_qr_issuances`에 독립적으로 기록된다("장부 1", 매장측 실체 증명 — 그 시각 그 매장에 실제로 화면이 존재해야만 생성 가능).
+2. 고객은 앱으로 그 QR을 스캔하고, 위치(GPS) + 디바이스 무결성 증명과 함께 서버에 제출 — `store_checkins`에 기록된다("장부 2", 고객측 제출).
+3. 서버는 두 장부를 대조: `qr_issuance_id`가 실재하고 미만료·미사용이며, `client_lat/lng`가 매장 반경(`geofence_radius_m`) 내인 경우에만 `status=verified`로 확정 — 한쪽 장부만 조작(GPS 스푸핑만, 또는 QR 스크린샷 공유만)해서는 보상이 나가지 않는다.
+4. `qr_issuance_id` UNIQUE로 동일 QR 토큰 재사용(스크린샷 돌려쓰기, 여러 계정이 같은 QR 제출) 원천 차단 — 토큰은 발급 후 짧은 주기 내 1인 1회만 소비 가능.
+5. GPS는 그 자체로 모킹 가능하므로 OS 레벨 무결성 증명(Android Play Integrity API / iOS DeviceCheck)을 병행 — `device_integrity_verified=false`면 자동으로 `flagged` 처리, 보상은 검토 전까지 보류.
+6. 검증 통과 + 일/주 한도 이내인 경우에만 `bonus_credit_grants`(`source_type=offline_checkin`, §7)로 무상 적립금 지급.
+
+**설계 포인트 — 무료 적립금 채굴(Farming) 방지**
+- **핵심 장치**: `offline_checkin_reward_rules.lifetime_free_cap_without_paid_charge` — `user_loyalty_status.cumulative_charge_amount`(§8, 유상 충전 누적)가 0인 유저의 `cumulative_free_offline_bonus`(오프라인 체크인 무상 적립금 누적)가 이 상한에 도달하면 더 이상 지급하지 않는다(`403 FREE_CREDIT_CAP_REACHED_REQUIRES_CHARGE`). 즉 "최소 1회 유상 충전"을 해야 그 이후로는 정상적인 일/주 한도로 계속 받을 수 있다 — 카드샵 방문만 반복해서 무한정 무료 재화를 채굴하는 경로를 구조적으로 막는다.
+- **이상 탐지(비동기)**: 체크인 직후 Celery 잡이 (a) 직전 체크인과의 이동거리/시간으로 물리적으로 불가능한 이동인지(`impossible_travel`), (b) 동일 `device_id`가 여러 `user_id`로 체크인하는지(`device_multi_account`), (c) 동일 매장에서 짧은 시간 내 비정상적으로 많은 서로 다른 신규 계정이 몰리는지(`shop_anomaly`, 매장 결탁 의심)를 검사해 `offline_checkin_fraud_flags`에 적재. 의심 건은 지급을 보류하고 관리자 검토 후 `confirmed_fraud`면 회수(및 해당 유저/매장 체크인 자격 정지 검토), `cleared`면 지급 재개.
+- 매장 등록(`partner_stores`) 자체도 관리자 승인제(`status=pending→active`)로 운영해, 아무 장소나 셀프 등록해 스스로 방문 처리하는 것을 방지.
+
+---
+
+## 13. 설계 노트
+
+### 13.1 `cards.attributes` JSONB 스키마 예시 (게임별)
 
 ```jsonc
 // Pokemon
@@ -839,7 +929,7 @@ erDiagram
 ```
 공통 컬럼(`rarity`, `card_number`, `name`)만 정규화하고 나머지는 JSONB로 흡수 → 신규 게임 추가 시 스키마 마이그레이션 불필요, 대신 애플리케이션 레벨(Pydantic discriminated union)에서 게임별 검증.
 
-### 12.2 인덱스 전략(주요)
+### 13.2 인덱스 전략(주요)
 - `cards`: `(card_set_id, card_number)` UNIQUE, `attributes` GIN 인덱스(검색/필터용).
 - `physical_cards`: `serial_no` UNIQUE, `status` 부분 인덱스(`WHERE status = 'in_stock'`) — 재고 조회 최적화.
 - `oripa_slots`: `(pack_id, slot_no)` UNIQUE, `physical_card_id` UNIQUE, `(pack_id, status)` 부분 인덱스(`WHERE status='available'`) — 뽑기 시 잔여 슬롯 스캔 최적화.
@@ -850,8 +940,10 @@ erDiagram
 - `bonus_credit_grants`: `(wallet_id, expires_at)` 부분 인덱스(`WHERE remaining_amount > 0`) — 만료 배치/FIFO 소진 스캔용.
 - `user_missions`: `(user_id, mission_id)` UNIQUE.
 - `free_draw_tickets`: `(user_id, status)` 부분 인덱스(`WHERE status='available'`), `expires_at` 만료 배치용.
+- `store_qr_issuances`: `qr_token` UNIQUE, `expires_at` 만료 배치용.
+- `store_checkins`: `qr_issuance_id` UNIQUE, `(user_id, created_at)` 복합 인덱스 — 일/주 한도 집계 및 이동거리 이상탐지용.
 
-### 12.3 동시성 & 정합성 강제 요약
+### 13.3 동시성 & 정합성 강제 요약
 
 | 요구사항 | 강제 방법 |
 |---|---|
@@ -868,3 +960,5 @@ erDiagram
 | 수동 보정 카드 데이터 덮어쓰기 방지 | `cards.locked_fields`에 잠긴 필드는 동기화 diff 계산에서 제외 |
 | 위탁 카드 정산금 조기 유출 방지 | `settlement_holds`는 배송 확정(`confirmed_at`) 전까지 `released`로 전환 불가 (애플리케이션 레벨 상태머신 + 배치 검증) |
 | 위탁자 정산 이중 지급 방지 | `consignor_payouts`는 `available_balance` 범위 내에서만 생성, 지급 완료 후 `consignor_ledger_entries`에 `payout` 차감 기록 |
+| 동일 QR 토큰 재사용(리플레이) 방지 | `store_checkins.qr_issuance_id` UNIQUE, `store_qr_issuances.expires_at` 경과 토큰은 소비 불가 |
+| 무료 적립금 무한 채굴 방지 | 유상 충전 이력(`cumulative_charge_amount`) 없는 유저는 `cumulative_free_offline_bonus`가 `lifetime_free_cap_without_paid_charge` 도달 시 오프라인 체크인 보상 지급 중단 |
