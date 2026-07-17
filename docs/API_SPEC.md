@@ -536,7 +536,7 @@ GET /users/me/wallet
 - 중복 체크인 시 `409 ALREADY_CHECKED_IN`.
 - **보상은 정적 캘린더가 아니라 매번 계산**된다 — 결제 이력(`last_charge_at`/`cumulative_charge_amount`), 연속 출석일수, 최근 이용도(뽑기·미션 완료 등)를 가중합한 점수로 `reward_value`가 산출된다(`attendance_reward_policies`, §ERD.md §8). 결제 없이 오래 이용할수록 `decay_window_days`에 걸쳐 서서히 줄지만(하루 변화폭이 작아 체감되지 않음), `milestone_days`(10·20일차 등)는 여전히 고가치 보상을 보장한다.
 - **코스메틱은 출석으로 지급되지 않는다** — 프로필 장식은 오직 결제 등급 달성 시에만 자동 해금된다(`GET /users/me/loyalty` 참고).
-- `long_term_free_threshold_days`를 넘긴 무결제 유저는 `reward_source=lucky_box`로 전환된다 — 대부분 소액(`outcome_code=small`)이지만 낮은 확률로 큰 보상(`jackpot`)이 나올 수 있어 산술적 기댓값 자체는 낮지 않다.
+- `long_term_free_threshold_days`를 넘긴 무결제 유저는 `reward_source=lucky_box`로 전환된다 — 대부분 소액(`outcome_code=small`)이지만 낮은 확률로 큰 보상(`jackpot`)이 나올 수 있다. 단, 기댓값 자체는 그 시점의 decay 적용 동적 보상보다 **의도적으로 살짝 낮게**(`lucky_box_target_ev_ratio`) 설계되어 있다 — 평균 지급액을 늘리지 않으면서 변동성만으로 흥미를 유지하는 구조다.
 
 **GET /events/attendance/status — 응답 예시**
 ```json
@@ -774,22 +774,25 @@ GET /users/me/wallet
   "milestone_bonus_multiplier": 3.0,
   "long_term_free_threshold_days": 60,
   "long_term_free_lucky_box_enabled": true,
+  "lucky_box_target_ev_ratio": 0.85,
   "is_active": true
 }
 ```
 - `decay_window_days`를 넉넉히(예: 90일) 잡을수록 일 단위 변화폭이 작아져 유저가 감소를 체감하기 어렵다 — 절벽형 강등 대신 완만한 곡선을 의도적으로 사용.
+- `lucky_box_target_ev_ratio`(1.0 미만, 예: 0.85)는 럭키박스 전환 후 기댓값이 그 시점 decay 적용 동적 보상보다 **더 낮아야** 한다는 제약이다 — 변동성으로 흥미는 유지하되 평균 지급액을 늘리지 않는다.
 
 **POST /admin/attendance-reward-policies/{id}/lucky-box-outcomes — 요청 예시**
 ```json
+// 이 시점 decay 적용 동적 보상이 100이라고 가정 (baseline)
 {
   "outcomes": [
-    { "outcome_code": "small", "probability": 0.90, "reward_type": "bonus_credit", "reward_value": 50 },
-    { "outcome_code": "medium", "probability": 0.09, "reward_type": "bonus_credit", "reward_value": 500 },
-    { "outcome_code": "jackpot", "probability": 0.01, "reward_type": "free_draw_ticket", "reward_value": 1 }
+    { "outcome_code": "small", "probability": 0.90, "reward_type": "bonus_credit", "reward_value": 60 },
+    { "outcome_code": "medium", "probability": 0.09, "reward_type": "bonus_credit", "reward_value": 250 },
+    { "outcome_code": "jackpot", "probability": 0.01, "reward_type": "bonus_credit", "reward_value": 850 }
   ]
 }
 ```
-- `probability` 합이 1.0이 아니면 `422 VALIDATION_ERROR` 반환. 기댓값(`Σ probability × reward_value` 환산)이 확정형 보상보다 높게 설계돼도, 90%는 `small`만 받으므로 실사용자 체감가치는 낮다 — "장기 무결제자에게는 덜 필요하지만 기댓값은 높은 보상"을 이 테이블로 구현한다.
+- `probability` 합이 1.0이 아니면 `422 VALIDATION_ERROR` 반환. 위 예시의 기댓값은 `0.90×60 + 0.09×250 + 0.01×850 = 85`로, baseline(100) 대비 `lucky_box_target_ev_ratio=0.85`를 만족한다 — 이 제약을 어겨 기댓값이 baseline보다 높아지도록 등록하면 `422 LUCKY_BOX_EV_TOO_HIGH`로 거부된다. 대부분(90%)은 `small`만 받아 체감가치는 더욱 낮지만, 평균 지급액 자체도 늘리지 않는 것이 원칙이다.
 
 **POST /admin/cosmetic-items — 요청 예시**
 ```json
@@ -1050,3 +1053,4 @@ sequenceDiagram
 | 429 | `DAILY_CHECKIN_LIMIT_REACHED` / `WEEKLY_CHECKIN_LIMIT_REACHED` | 오프라인 체크인 일/주 한도 초과 |
 | 403 | `FREE_CREDIT_CAP_REACHED_REQUIRES_CHARGE` | 유상 충전 이력 없이 무료 적립금 누적 상한 도달 — 최소 1회 충전 필요 |
 | 403 | `COSMETIC_NOT_UNLOCKED` | 미해금 코스메틱 아이템 착용 시도 |
+| 422 | `LUCKY_BOX_EV_TOO_HIGH` | 럭키박스 확률 테이블의 기댓값이 `lucky_box_target_ev_ratio` 제약(baseline 미만)을 위반 |

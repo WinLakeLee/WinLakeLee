@@ -534,6 +534,7 @@ erDiagram
         numeric milestone_bonus_multiplier "마일스톤 날 보상 배율"
         int long_term_free_threshold_days "이 일수 이상 무결제 지속 시 럭키박스 방식으로 전환"
         boolean long_term_free_lucky_box_enabled
+        numeric lucky_box_target_ev_ratio "럭키박스 기댓값 목표 비율, 예: 0.85 = 그 시점 decay 적용 동적 보상의 85%. 반드시 1.0 미만"
         boolean is_active
         timestamptz valid_from
         timestamptz valid_to
@@ -681,7 +682,7 @@ erDiagram
 - 고정된 날짜별 보상 테이블 대신, 매 체크인마다 `attendance_reward_policies`의 가중치로 그 유저의 **결제 이력**(`last_charge_at`/`cumulative_charge_amount`), **연속 출석일수**(`streak_count`), **기타 이용도**(뽑기 횟수, 완료한 미션 수 등)를 합산한 `activity_score`를 계산해 보상을 그때그때 산출한다. `attendance_logs.activity_score_snapshot`에 계산근거를 남겨 재현·감사가 가능하다.
 - **서서히, 감지 못하게 감소**: 무결제 상태가 `decay_start_days`(예: 15일)를 넘기면 그 즉시 확 줄이는 게 아니라, `decay_window_days`(예: 90일)에 걸쳐 서서히 `decay_floor_multiplier`(예: 0.7)까지 하락시킨다 — 하루 변화폭이 1% 미만이라 유저가 "오늘 갑자기 줄었다"고 체감하지 못한다. 절벽형 등급 강등은 두지 않는다.
 - **마일스톤 스파이크**: `milestone_days`(예: 7·10·20·30·50·100일차)에는 결제 여부와 무관하게 `milestone_bonus_multiplier`를 곱한 고가치 보상을 지급해 장기 이탈을 방지하고 "다음 마일스톤까지 채워야지" 하는 동기를 유지시킨다.
-- **장기 무결제자 = 확정형 → 확률형(럭키박스) 전환**: `long_term_free_threshold_days`를 넘긴 무결제 유저는 보상 방식이 `attendance_lucky_box_outcomes`의 확률 테이블로 전환된다. 예: 90% 확률로 소액, 9% 확률로 중간값, 1% 확률로 잭팟(고가 무료뽑기권) — 산술적 기댓값은 일반 확정형 보상보다 높게 설계할 수 있지만, 실제로는 대부분(90%) 소액만 받으므로 체감가치·실사용 필요성은 낮다. "당첨되면 크다"는 기대감으로 이탈은 막으면서, 평균 지급원가는 낮게 통제하는 구조다.
+- **장기 무결제자 = 확정형 → 확률형(럭키박스) 전환**: `long_term_free_threshold_days`를 넘긴 무결제 유저는 보상 방식이 `attendance_lucky_box_outcomes`의 확률 테이블로 전환된다. 예: 88% 확률로 소액, 10% 확률로 중간값, 2% 확률로 잭팟(무료뽑기권) — **기댓값 자체도 그 시점의 decay 적용 동적 보상보다 살짝 낮게**(`lucky_box_target_ev_ratio`, 예: 0.85) 설계한다. 즉 평균적으로는 이전보다 조금 덜 받지만, 분산이 커서 "가끔 크게 받을 수도 있다"는 기대감만 남기고 매일 조금씩 깎이는 느낌은 주지 않는다 — 기댓값을 부풀리지 않으면서도 체감상의 지루한 하락 대신 변동성으로 흥미를 유지하는 것이 핵심.
 - **결제 관련 혜택은 그대로**: 위 감소/럭키박스 전환은 오직 **출석 보상**에만 적용된다. 배송비 할인, 충전 보너스(§7 `charge_bonus_rules`), PG 결제 조건 등 결제와 관련된 혜택·조건은 결제 이력과 무관하게 모든 유저에게 동일하게 적용한다 — 장기 무결제자를 다른 영역에서까지 차별하지 않는다.
 
 **설계 포인트 — 로열티 등급 & 코스메틱 (출석 보상과는 완전히 분리)**
@@ -1036,4 +1037,5 @@ erDiagram
 | 무료 적립금 무한 채굴 방지 | 유상 충전 이력(`cumulative_charge_amount`) 없는 유저는 `cumulative_free_offline_bonus`가 `lifetime_free_cap_without_paid_charge` 도달 시 오프라인 체크인 보상 지급 중단 |
 | 장기 무결제자 출석 보상 감소가 결제 혜택까지 침범하지 않도록 격리 | `attendance_reward_policies`/`attendance_lucky_box_outcomes`는 `bonus_credit_grants`(§7)만 갱신, `loyalty_tiers.benefits`·`charge_bonus_rules`(결제 혜택)는 별도 경로로 절대 참조하지 않음 |
 | 럭키박스 확률 합계 오류 방지 | `attendance_lucky_box_outcomes` 저장 시 `SUM(probability) = 1.0` 애플리케이션 검증, 불일치 시 저장 거부 |
+| 럭키박스 기댓값이 일반 보상보다 높아지는 것 방지 | 저장 시 `Σ(probability × reward_value) <= 그 시점 decay 적용 동적 보상 × lucky_box_target_ev_ratio`(1.0 미만)를 검증, 위반 시 저장 거부 |
 | 코스메틱 중복 해금 방지 | `user_cosmetic_unlocks.(user_id, cosmetic_item_id)` UNIQUE |
