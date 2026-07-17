@@ -228,7 +228,7 @@ erDiagram
 - `cards.attributes`(JSONB)로 게임별 스키마 차이를 흡수 — 별도 마이그레이션 없이 신규 게임 추가 가능.
 - `(card_set_id, card_number)` 복합 UNIQUE로 동일 세트 내 중복 등록 방지.
 - `source`로 API 동기화/크롤링/수동 입력 이력을 구분해 배치 재동기화 시 수동 보정 데이터 덮어쓰기 방지.
-- `card_market_prices`는 TCGPlayer·일본 토레카 시세 등 외부 시세를 주기적으로 동기화(§10 데이터 수집 파이프라인과 유사한 배치)해 카드 단위 최신 시세를 유지 — §6 즉시 시세 환급, 원래 계획서 §8 "카드 시세 연동" 기능의 기반 데이터가 된다. `fetched_at`이 오래된(신뢰 만료) 시세는 §6 `instant_exchange_policies.max_price_age_hours`에 의해 즉시 환급 대상에서 제외되고 수동 심사로 넘어간다.
+- `card_market_prices`는 TCGPlayer·일본 토레카 시세 등 외부 시세를 주기적으로 동기화(§10 데이터 수집 파이프라인과 유사한 배치)해 카드 단위 최신 시세를 유지 — §6 즉시 시세 환급, 원래 계획서 §8 "카드 시세 연동" 기능의 기반 데이터가 된다. 뽑기 확정 시점(§5)에 `fetched_at`이 오래된(신뢰 만료) 시세만 존재하면 §6 `instant_exchange_policies.max_price_age_hours`에 의해 스냅샷을 남기지 않고, 그 카드는 이후 환급 요청 시 자동으로 수동 심사로 넘어간다.
 
 ---
 
@@ -336,6 +336,7 @@ erDiagram
 3. **리빌(Reveal)**: `status = settled` 전환 시 `server_seed` 공개 → 누구나 최초 커밋 해시와 대조해 매핑 조작 여부 검증 가능 (API: `GET /oripa-packs/{id}/proof`).
 4. `draw_logs`는 append-only(UPDATE/DELETE 금지, DB 권한으로 강제) 감사 로그.
 5. `payment_method=free_ticket`인 뽑기는 `free_draw_tickets.status`를 `used`로 전환하고 포인트 차감이 없다(§8 이벤트 보상 연동).
+6. `user_inventory` 생성과 같은 트랜잭션 안에서 `card_market_prices`의 그 시점 최신 시세를 `locked_reference_price`로 스냅샷한다(§6) — 즉시 시세 환급 금액이 이후 시세 변동과 무관하게 뽑힌 순간의 값으로 고정되도록 하는 지점이 바로 여기다.
 
 ---
 
@@ -351,7 +352,7 @@ erDiagram
     USER_INVENTORY ||--o| SHIPPING_REQUEST_ITEMS : included
     USER_INVENTORY ||--o| REFUND_REQUESTS : "refunded via"
     USER_INVENTORY ||--o| DELIVERY_DISPUTES : "disputed via"
-    CARD_MARKET_PRICES ||--o{ REFUND_REQUESTS : "prices via"
+    CARD_MARKET_PRICES ||--o{ USER_INVENTORY : "snapshotted into"
 
     USER_INVENTORY {
         bigint id PK
@@ -360,6 +361,9 @@ erDiagram
         varchar source "draw, purchase, event, attendance_lucky_box"
         bigint source_ref_id "draw_logs.id 등"
         varchar status "held, shipping_requested, shipped, delivered, confirmed, disputed, refunded"
+        numeric locked_reference_price "획득(뽑기) 시점 card_market_prices 스냅샷 — 즉시환급 계산은 이 값만 사용, 이후 시세변동 미반영"
+        bigint locked_price_source_id FK "스냅샷 당시 참조한 CARD_MARKET_PRICES 레코드, 감사용"
+        timestamptz locked_price_fetched_at "스냅샷된 시세의 원 fetched_at"
         timestamptz acquired_at
     }
 
@@ -401,7 +405,7 @@ erDiagram
         bigint user_id FK
         numeric refund_points
         varchar valuation_method "instant_market_price, manual_review"
-        bigint market_price_ref_id FK "CARD_MARKET_PRICES 참조, instant_market_price일 때만"
+        numeric priced_from_locked_reference_price "계산에 쓰인 user_inventory.locked_reference_price 그대로 복사(감사용) — 요청 시점 시세를 다시 조회하지 않음"
         numeric buy_rate_applied "적용된 매입률, 예: 0.8"
         varchar status "pending, approved, rejected, paid"
         timestamptz requested_at
@@ -412,7 +416,7 @@ erDiagram
         bigint id PK
         numeric buy_rate "시세 대비 매입률, 예: 0.8 = 시세의 80%"
         jsonb condition_multipliers "그레이딩/컨디션별 배율, 예: {\"PSA10\":1.0,\"PSA9\":0.7,\"NM\":0.5,\"DMG\":0.05}"
-        int max_price_age_hours "이 시간 초과한 시세는 신뢰하지 않고 manual_review로 전환"
+        int max_price_age_hours "뽑기 확정 시점 기준 이 시간 초과한 시세는 스냅샷하지 않고 manual_review로 전환"
         boolean is_active
     }
 ```
@@ -424,8 +428,9 @@ erDiagram
 - `delivery_disputes`는 위탁/플랫폼 소유 카드 모두에 적용되는 공통 이의제기 창구이며, `consignor_id`가 있는 케이스는 처리 결과에 따라 §11의 정산 보류가 취소·차감될 수 있다.
 
 **설계 포인트 — 즉시 시세 환급 (뽑은 카드를 배송 대신 바로 현금화)**
-- 뽑은 카드는 배송 신청 전 언제든 `refund_requests`로 "환급(즉시 교환)"을 요청할 수 있다. `card_market_prices`(§3)에서 해당 카드의 최신 참조 시세를 조회하고, `instant_exchange_policies.condition_multipliers`로 그 실물의 `condition_grade`/`grading_score`(§4)에 따른 배율을 곱한 뒤, `buy_rate`(예: 0.8 — KREAM·스니커즈덩크류 리셀 플랫폼의 매입가가 시세보다 낮게 책정되는 것과 같은 원리로 플랫폼 마진 확보)를 적용해 최종 지급액을 산출한다.
-- 계산에 쓸 시세가 `max_price_age_hours`보다 오래됐거나 아예 없으면(`valuation_method`를 자동으로 `manual_review`로 전환) 기존처럼 관리자 심사 큐로 넘어간다 — 신뢰할 수 있는 시세가 있을 때만 즉시 처리.
+- **기준가는 뽑힌 시점에 고정(스냅샷)한다.** 오리파 뽑기가 확정되는 순간(§5) `card_market_prices`의 그 시점 최신값을 `user_inventory.locked_reference_price`로 즉시 복사해둔다 — 이후 실제 시세가 오르든 내리든, 그 카드의 즉시환급 계산은 **오직 이 스냅샷 값만** 사용한다. 요청 시점에 시세를 다시 조회하지 않으므로, 유저가 카드를 오래 들고 있다가 "시세가 올랐으니" 더 높은 금액을 받아가는 차익거래가 원천적으로 불가능하다(반대로 시세가 내려도 손해를 보지 않는다 — 결과적으로 플랫폼도 유저도 시세 변동에 노출되지 않는 중립적 구조).
+- 환급 요청 시엔 `locked_reference_price`에 `instant_exchange_policies.condition_multipliers`(§4 `condition_grade`/`grading_score` 기준)와 `buy_rate`(예: 0.8 — KREAM·스니커즈덩크류 리셀 플랫폼이 시세보다 낮게 매입하는 것과 같은 원리로 플랫폼 마진 확보)를 곱해 최종 지급액을 산출한다. `refund_requests.priced_from_locked_reference_price`에 계산에 쓰인 스냅샷 값을 그대로 복사해 감사 가능하게 남긴다.
+- 뽑기 확정 시점에 참조할 시세 데이터 자체가 없으면(`card_market_prices` 미존재) `locked_reference_price`는 NULL로 남고, 이후 환급 요청은 자동으로 `valuation_method=manual_review`(관리자 심사)로 전환된다 — 스냅샷이 없는 카드는 즉시 처리 대상이 아니다.
 - `valuation_method=instant_market_price`인 요청은 생성과 동시에 `status=paid`로 확정되고 `ledger_entries`에 `refund_credit` 항목이 즉시 기록된다(§7) — 관리자 승인 대기 없이 단일 DB 트랜잭션으로 종료.
 - `refund_credit`은 유상 잔액(`balance_type=paid`)으로 적립된다 — 뽑기에 실제 결제한 가치를 되돌려주는 성격이라 무상 적립금과 구분(§7 §12 무료 채굴 방지 상한 계산에도 포함되지 않음).
 
@@ -1071,4 +1076,5 @@ erDiagram
 | 럭키박스 확률 합계 오류 방지 | `attendance_lucky_box_outcomes` 저장 시 `SUM(probability) = 1.0` 애플리케이션 검증, 불일치 시 저장 거부 |
 | 럭키박스 기댓값이 일반 보상보다 높아지는 것 방지 | 저장 시 `Σ(probability × reward_value) <= 그 시점 decay 적용 동적 보상 × lucky_box_target_ev_ratio`(1.0 미만)를 검증, 위반 시 저장 거부 |
 | 코스메틱 중복 해금 방지 | `user_cosmetic_unlocks.(user_id, cosmetic_item_id)` UNIQUE |
-| 신뢰할 수 없는 시세로 즉시 환급되는 것 방지 | `card_market_prices.fetched_at`이 `instant_exchange_policies.max_price_age_hours`를 초과하면 `valuation_method`가 자동으로 `manual_review`로 전환, 즉시 지급(`status=paid`) 경로 차단 |
+| 신뢰할 수 없는 시세로 즉시 환급되는 것 방지 | 뽑기 확정 시점 `card_market_prices.fetched_at`이 `instant_exchange_policies.max_price_age_hours`를 초과하면 `user_inventory.locked_reference_price`를 NULL로 두어 이후 환급이 자동으로 `manual_review`로 전환되고, 즉시 지급(`status=paid`) 경로가 차단됨 |
+| 시세 변동 차익거래(뽑은 뒤 오른 가격으로 환급) 방지 | 즉시환급 계산은 항상 `user_inventory.locked_reference_price`(뽑기 확정 시점 스냅샷)만 사용, 환급 요청 시점에 `card_market_prices`를 재조회하지 않음(애플리케이션 레벨 — 조회 자체를 하지 않도록 구현) |

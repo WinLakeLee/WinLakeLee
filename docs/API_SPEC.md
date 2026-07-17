@@ -284,6 +284,7 @@ sequenceDiagram
     API->>DB: 잔액 검증, ledger_entries INSERT(draw_spend, -price)
     API->>DB: SELECT available slots FOR UPDATE SKIP LOCKED
     API->>API: secrets.randbelow(remaining_count)로 슬롯 선택
+    API->>DB: card_market_prices 최신값 조회 → user_inventory.locked_reference_price로 스냅샷
     API->>DB: slot.status='drawn', draw_logs INSERT, user_inventory INSERT
     API->>DB: COMMIT
     API->>Redis: 락 해제
@@ -319,12 +320,14 @@ Idempotency-Key: 9a1f4c3d-...
   "points_spent": 3000,
   "bonus_spent": 500,
   "wallet_balance_after": { "paid": 46500, "bonus": 0 },
-  "remaining_slots": 36
+  "remaining_slots": 36,
+  "locked_reference_price": 45000
 }
 ```
 - `ticket_id` 생략 시 포인트 차감(무상 적립금 우선 소진 후 유상 잔액, §ERD.md §7), `ticket_id` 지정 시 해당 `free_draw_tickets`를 소비하고 포인트 차감 없음(`payment_method: "free_ticket"`).
 - `ticket_id`가 지정한 `pack_scope`와 대상 팩이 맞지 않으면 `422 TICKET_SCOPE_MISMATCH`, 이미 사용/만료된 티켓이면 `409 TICKET_NOT_AVAILABLE`.
 - 실패: `409 PACK_SOLD_OUT`, `402 INSUFFICIENT_BALANCE`, `423 PACK_LOCKED`(락 획득 실패, 재시도 유도).
+- `locked_reference_price`는 뽑힌 그 순간 `card_market_prices`에서 스냅샷된 값이다(시세 데이터가 없는 카드는 `null`). §4의 즉시 시세 환급은 이후 이 값이 오르든 내리든 **항상 이 스냅샷만** 사용하며, 요청 시점에 시세를 다시 조회하지 않는다 — "뽑고 나서 시세가 올랐다고 더 받는" 차익거래를 구조적으로 차단한다.
 
 **GET /oripa-packs/{id}/proof — sold_out 이전/이후**
 ```json
@@ -377,36 +380,39 @@ Idempotency-Key: 9a1f4c3d-...
 **GET /users/me/inventory/{id}/exchange-quote — 응답 예시**
 ```json
 {
-  "reference_price": 45000,
+  "locked_reference_price": 45000,
+  "current_market_price": 61000,
   "condition_grade": "NM",
   "condition_multiplier": 0.5,
   "buy_rate": 0.8,
   "estimated_refund_points": 18000,
   "quote_basis": "instant_market_price",
-  "price_fetched_at": "2026-07-17T03:00:00Z"
+  "locked_at": "2026-07-17T09:50:00Z"
 }
 ```
-- 계산식: `reference_price(45000) × condition_multiplier(0.5) × buy_rate(0.8) = 18000`. 시세가 오래되어(`max_price_age_hours` 초과) 신뢰할 수 없으면 `quote_basis: "manual_review"`와 함께 확정 금액 대신 "관리자 심사 후 안내" 메시지를 반환한다.
+- 계산식은 항상 `locked_reference_price`(뽑힌 순간의 스냅샷) 기준: `45000 × 0.5 × 0.8 = 18000`. 응답에 참고용으로 `current_market_price`(지금 이 순간의 실시간 시세)를 같이 보여주되, 실제 지급액 계산에는 전혀 반영되지 않는다 — 이 예시처럼 시세가 그새 61000으로 올랐어도 환급액은 스냅샷 기준 18000 그대로다.
+- 뽑을 당시 시세 데이터가 없어 `locked_reference_price`가 `null`인 카드는 `quote_basis: "manual_review"`와 함께 확정 금액 대신 "관리자 심사 후 안내" 메시지를 반환한다.
 
 **POST /refund-requests — 요청/응답 예시**
 ```json
 // Request
 { "user_inventory_id": 88250 }
 
-// 201 Response — 신뢰 가능한 시세 존재, 즉시 확정
+// 201 Response — 뽑을 당시 스냅샷된 시세 존재, 즉시 확정
 {
   "id": 771,
   "status": "paid",
   "valuation_method": "instant_market_price",
+  "priced_from_locked_reference_price": 45000,
   "refund_points": 18000,
   "wallet_balance_after": { "paid": 18000, "bonus": 0 },
   "processed_at": "2026-07-17T10:05:00Z"
 }
 
-// 201 Response — 시세 없음/신뢰 불가 → 기존 관리자 심사 큐로
+// 201 Response — 스냅샷 없음 → 기존 관리자 심사 큐로
 { "id": 772, "status": "pending", "valuation_method": "manual_review", "estimated_refund_points": null }
 ```
-- `valuation_method=instant_market_price`인 경우 생성과 동시에 `status=paid`로 확정되고 `ledger_entries`에 `refund_credit`(`balance_type=paid`)이 즉시 기록된다 — 관리자 승인 대기 없이 단일 트랜잭션으로 종료(§ERD.md §6).
+- `valuation_method=instant_market_price`인 경우 생성과 동시에 `status=paid`로 확정되고 `ledger_entries`에 `refund_credit`(`balance_type=paid`)이 즉시 기록된다 — 관리자 승인 대기 없이 단일 트랜잭션으로 종료(§ERD.md §6). 이 계산은 **환급 요청 시점의 시세를 다시 조회하지 않고** `user_inventory.locked_reference_price`만 사용한다.
 - `manual_review`로 전환된 건은 기존과 동일하게 `POST /admin/refund-requests/{id}/approve`로 관리자가 처리한다.
 
 **POST /shipping-requests/{id}/confirm-receipt / dispute — 수령 확인 & 이의제기**
