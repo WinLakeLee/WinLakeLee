@@ -428,7 +428,8 @@ erDiagram
     PAYMENT_TRANSACTIONS {
         bigint id PK
         bigint user_id FK
-        varchar pg_provider "toss, portone"
+        varchar pg_provider "portone(통합 게이트웨이, 기본값)"
+        varchar sub_pg "nhn_kcp, kg_inicis, toss, kakaopay — 실제 라우팅된 하위 PG, API_SPEC.md §5.1 참고"
         varchar pg_tid UK
         numeric amount
         varchar method "card, transfer, kakaopay, naverpay"
@@ -687,7 +688,7 @@ erDiagram
         numeric withholding_tax_amount "기타소득 원천징수 등, 세무 규정에 따름"
         numeric net_amount
         varchar payout_status "pending, processing, paid, failed"
-        varchar pg_payout_ref "PG 지급대행(정산대행) API 참조번호"
+        varchar pg_payout_ref "지급대행 벤더 참조번호 (포트원 파트너 정산 자동화 우선, API_SPEC.md §5.1 참고)"
         timestamptz requested_at
         timestamptz paid_at
     }
@@ -698,12 +699,12 @@ erDiagram
 2. **보류 생성**: 위탁 카드가 오리파에서 뽑히는 순간(`draw_logs` 생성 시점) `settlement_holds`가 `status=held`로 즉시 생성되고, 동시에 `consignor_ledger_entries`에 `sale_hold`(+`hold_amount`, pending) 기록 → `consignor_wallets.pending_balance` 증가. **이 시점엔 위탁자에게 실제 지급되지 않는다** — 구매자가 아직 실물을 받지 못했기 때문.
 3. **보류 해제**: 배송 완료 후 `shipping_requests.confirmed_at`이 채워지면(구매자 명시적 확인 또는 §6 `inspection_deadline_at` 경과 자동 확정) `settlement_holds.status=released` 전환, `consignor_ledger_entries`에 `sale_release` 기록 → `pending_balance`에서 `available_balance`로 이동.
 4. **분쟁 시 처리**: 검수 기간 내 `delivery_disputes`가 열리면 보류 해제가 정지된다. 위탁자 귀책(그레이딩/사진과 실물 불일치 등)으로 판정되면 `settlement_holds.status=reversed` + `dispute_reversal` 기록으로 보류 취소, 구매자는 재배송/환급을 플랫폼 자체 재고 또는 별도 보상 재원으로 처리(위탁자에게 책임을 전가하되 구매자 피해를 위탁자 귀책 확정까지 기다리게 하지 않음).
-5. **출금**: `available_balance`가 쌓인 위탁자는 `consignor_payouts` 요청 → **플랫폼이 직접 계좌 이체하지 않고 PG의 지급대행(정산대행) API(`pg_payout_ref`)를 경유** — 플랫폼이 임의 계좌로 직접 송금하면 전자금융거래법상 지급대행업 등록 이슈가 발생할 수 있어 반드시 라이선스가 있는 PG 경유.
+5. **출금**: `available_balance`가 쌓인 위탁자는 `consignor_payouts` 요청 → **플랫폼이 직접 계좌 이체하지 않고 지급대행 벤더(`pg_payout_ref`)를 경유** — 1순위는 세금계산서 자동발행까지 지원하는 포트원 파트너 정산 자동화, 위탁 거래량이 커지면 토스페이먼츠 지급대행(월 정액제)과 재비교(API_SPEC.md §5.1). 플랫폼이 임의 계좌로 직접 송금하면 전자금융거래법상 지급대행업 등록 이슈가 발생할 수 있어 반드시 라이선스가 있는 벤더를 경유.
 6. 개인 위탁자 대상 지급은 세법상 원천징수(예: 기타소득 3.3%) 대상일 가능성이 높아 `consignor_payouts.withholding_tax_amount`로 분리 계산 — 정확한 세율/신고 의무는 세무사 자문 필요.
 
 **법적 유의사항 (요약)**
 - 위탁 판매 자체가 중고/위탁물품 취급 관련 별도 신고·등록 대상인지 사업 개시 전 법률 검토 필요(§리스크, 오리지널 계획서 §10).
-- 위탁자 정산은 "PG 지급대행 경유"가 원칙 — 직접 계좌이체 자체 구현 금지.
+- 위탁자 정산은 "지급대행 벤더 경유"가 원칙(포트원 파트너 정산 자동화 우선) — 직접 계좌이체 자체 구현 금지.
 - 위탁자 개인정보(실명, 계좌, 세금 식별정보)는 §2와 동일하게 컬럼 단위 암호화(AES-256, KMS).
 
 ---

@@ -376,26 +376,55 @@ Idempotency-Key: 7c1b6e2a-...
 
 ## 5. Payment & Wallet Service
 
+### 5.1 PG / 지급대행 벤더 선정
+
+자체 PG·지급대행업 등록은 현실적으로 불가능(전자금융거래법상 자본금 10억원 이상, 전산전문인력 5인 이상 등 요건)하므로,
+기존 라이선스를 가진 벤더를 반드시 경유한다. 공개된 수수료율은 매출 규모·거래량에 따라 실제 협상에서 달라지는 경우가
+많아 최종 확정 전 직접 견적 비교가 필요하다.
+
+**결제(충전) — 구매자 대금**
+
+| 벤더 | 카드 수수료 | 가입비/관리비 | 비고 |
+|---|---|---|---|
+| **포트원(PortOne)** — 통합 게이트웨이 | 하위 PG 요율 그대로 적용 | 일부 PG 가입비 면제 패키지 제공 | 하나의 연동으로 하위 PG(KG이니시스/토스/카카오페이 등) 자유 교체·병행 — **1순위 채택** |
+| NHN KCP | 3.4% (계좌이체 1.8%, 가상계좌 300원) | 가입비 이벤트 무료, 연관리비 평생 면제 | 정산주기 선택 가능(일일~월1회) |
+| KG이니시스 | 2.1~3.3% (매출구간별 우대) | 약 22만원(솔루션 이용 시 면제 가능) | 우대구간 폭넓음 |
+| 토스페이먼츠 | 3.4~4.3% (등급/프로모션별 편차) | 연 11만원 | 개발 편의성 우수, 스타트업 프로모션 |
+| 카카오페이(간편결제) | 연매출 5억 이하 영세 0.5% | - | 포트원 경유 허브형 연동 권장 |
+
+→ **결정**: PG는 포트원을 게이트웨이로 두고, 초기 하위 PG는 NHN KCP(연관리비 평생면제) 또는 KG이니시스(낮은 우대 수수료)로 시작, 매출 성장 시 재협상.
+
+**지급대행(위탁자 정산) — §8 Consignment & Settlement Service 연동**
+
+| 벤더 | 요금 구조 | 비고 |
+|---|---|---|
+| **포트원 파트너 정산 자동화** | 견적 필요 | 정산금액 자동계산 + **세금계산서 발행 + 송금까지 자동화** — 개인 위탁자 원천징수 이슈까지 커버, 마켓플레이스/위탁판매 특화. **1순위 채택** |
+| 토스페이먼츠 지급대행 | 월 30만원 고정, 1,000건까지 무료 | 거래량이 월 1,000건을 넘어서면 건당 비용 유리 — 스케일 업 시 재비교 대상 |
+| 나이스페이먼츠 지급대행 | 월 15일 정산, 요율 비공개 | 오픈마켓형 하위판매자 정산에 특화 |
+
+→ **결정**: 초기엔 위탁 거래량이 적고 세금계산서/원천징수 자동화가 중요하므로 **포트원 파트너 정산 자동화**를 우선 채택, 위탁 거래량이 커지면 토스페이먼츠 지급대행과 손익분기점을 재계산해 전환을 검토한다.
+
 | Method | Path | Auth | 설명 |
 |---|---|---|---|
 | GET | `/users/me/wallet` | Bearer | 포인트 잔액 조회 |
 | POST | `/wallet/charges` | Bearer + Idempotency-Key | 결제 요청 생성 (PG 리다이렉트/승인용 정보 반환) |
-| POST | `/webhooks/payments/{provider}` | 서명 검증(HMAC) | PG 웹훅 콜백 (toss, portone) — server-to-server |
+| POST | `/webhooks/payments/{provider}` | 서명 검증(HMAC) | PG 웹훅 콜백 (`provider`: portone 경유가 기본, sub_pg로 실제 PG 구분) — server-to-server |
 | GET | `/users/me/ledger` | Bearer | 포인트 증감 원장 이력 |
 
 **POST /wallet/charges — 요청/응답 예시**
 ```json
 // Request
-{ "amount": 50000, "method": "card", "pg_provider": "toss" }
+{ "amount": 50000, "method": "card", "pg_provider": "portone", "sub_pg": "nhn_kcp" }
 
 // 200 Response
 {
   "payment_transaction_id": 33012,
   "status": "pending",
-  "pg_checkout_url": "https://pay.toss.im/...",
+  "pg_checkout_url": "https://checkout.portone.io/...",
   "amount": 50000
 }
 ```
+- `pg_provider`는 항상 `portone`(통합 게이트웨이), `sub_pg`로 실제 카드사 라우팅 PG(`nhn_kcp`, `kg_inicis`, `toss`, `kakaopay` 등)를 지정 — 특정 PG 장애/정책 변경 시 코드 변경 없이 `sub_pg` 라우팅만 교체 가능.
 
 **POST /webhooks/payments/{provider} — 검증 절차**
 1. `X-Signature` 헤더를 PG 공개 검증 규칙(HMAC-SHA256)으로 재계산 후 대조 — 불일치 시 `401` 즉시 반환.
@@ -579,7 +608,7 @@ sequenceDiagram
     Note over DB: pending_balance -> available_balance 이동
     Consignor->>API: POST /consignors/me/payouts
     API->>DB: consignor_payouts INSERT(status=pending)
-    API->>Consignor: PG 지급대행 API 호출 → 계좌 입금
+    API->>Consignor: 포트원 파트너 정산 자동화 API 호출 → 세금계산서 발행 + 계좌 입금
     API->>DB: consignor_payouts.status=paid, ledger에 payout(-amount) 기록
 ```
 
@@ -610,7 +639,7 @@ sequenceDiagram
 { "id": 550, "amount": 3400, "withholding_tax_amount": 112, "net_amount": 3288, "payout_status": "pending" }
 ```
 - 실패: `422 INSUFFICIENT_AVAILABLE_BALANCE`(요청 금액이 `available_balance` 초과), `403 PAYOUT_ACCOUNT_NOT_VERIFIED`(정산 계좌 미인증).
-- 실제 계좌 이체는 플랫폼이 직접 수행하지 않고 PG의 지급대행(정산대행) API를 호출한다 — 직접 송금 구현 시 전자금융거래법상 지급대행업 등록 이슈가 발생할 수 있음.
+- 실제 계좌 이체는 플랫폼이 직접 수행하지 않고 **포트원 파트너 정산 자동화 서비스**(1순위, 세금계산서 자동발행 포함)를 경유한다 — 위탁 거래량이 커지면 토스페이먼츠 지급대행(월 정액 30만원/1,000건)과 손익분기점을 재계산해 전환을 검토한다. 직접 계좌이체 자체 구현은 전자금융거래법상 지급대행업 등록 이슈로 금지(§5.1 참고).
 
 ---
 
