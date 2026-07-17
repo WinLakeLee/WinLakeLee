@@ -13,8 +13,9 @@
 5. [Payment & Wallet Service](#5-payment--wallet-service)
 6. [Event Service](#6-event-service)
 7. [Admin Service](#7-admin-service)
-8. [WebSocket — 실시간 뽑기 피드](#8-websocket--실시간-뽑기-피드)
-9. [에러 코드 표준](#9-에러-코드-표준)
+8. [Consignment & Settlement Service](#8-consignment--settlement-service)
+9. [WebSocket — 실시간 뽑기 피드](#9-websocket--실시간-뽑기-피드)
+10. [에러 코드 표준](#10-에러-코드-표준)
 
 ---
 
@@ -325,6 +326,8 @@ Idempotency-Key: 7c1b6e2a-...
 | POST | `/shipping-requests` | Bearer | 배송 신청 (여러 인벤토리 항목 묶음 가능) |
 | GET | `/shipping-requests/{id}` | Bearer | 배송 신청 상세/추적 |
 | GET | `/users/me/shipping-requests` | Bearer | 내 배송 신청 이력 |
+| POST | `/shipping-requests/{id}/confirm-receipt` | Bearer | 수령 확인(조기 확정) — 위탁 카드 정산 보류 해제 트리거 |
+| POST | `/shipping-requests/{id}/dispute` | Bearer | 수령 물품 이의제기 (검수기간 내) — 정산 보류 동결 |
 | POST | `/refund-requests` | Bearer | 포인트 환급(매입) 신청 |
 | GET | `/refund-requests/{id}` | Bearer | 환급 신청 상태 조회 |
 
@@ -354,6 +357,20 @@ Idempotency-Key: 7c1b6e2a-...
 { "id": 771, "status": "pending", "estimated_refund_points": 800 }
 ```
 - 승인(`admin`) 시 `ledger_entries`에 `refund_credit` 자동 기록되며 `status=paid`로 전환.
+
+**POST /shipping-requests/{id}/confirm-receipt / dispute — 수령 확인 & 이의제기**
+```json
+// 수령 확인
+// 200 Response
+{ "id": 5501, "status": "confirmed", "confirmed_at": "2026-07-20T09:00:00Z" }
+
+// 이의제기 Request
+{ "user_inventory_id": 88213, "reason": "condition_mismatch", "evidence_urls": ["https://cdn.../photo.jpg"] }
+// 201 Response
+{ "dispute_id": 331, "status": "open" }
+```
+- `delivered_at`으로부터 `inspection_deadline_at`(예: 7일)이 지나도록 확인/이의제기가 없으면 시스템이 자동으로 `confirmed_at`을 채운다(배치 잡).
+- 위탁 카드(§ERD.md §11)의 경우 `confirmed_at`이 채워지는 순간 `settlement_holds`가 해제되어 위탁자 정산이 진행되고, `dispute`가 열리면 해제가 동결된다. 상세 흐름은 §8 참고.
 
 ---
 
@@ -514,9 +531,90 @@ GET /users/me/wallet
 | GET | `/admin/dashboard/packs/{id}/pl` | 팩별 매출-원가(`acquired_cost` 합산)-마진 |
 | GET | `/admin/audit-logs` | 관리자 액션 감사 로그 조회 |
 
+### 7.6 위탁 심사 관리
+| Method | Path | 설명 |
+|---|---|---|
+| GET | `/admin/consignment-submissions?status=submitted` | 위탁 심사 대기열 |
+| POST | `/admin/consignment-submissions/{id}/approve` | 위탁 승인 — 정산가/수수료율 확정, `physical_cards`에 반영 |
+| POST | `/admin/consignment-submissions/{id}/reject` | 위탁 반려 |
+| GET | `/admin/settlement-holds?status=held` | 정산 보류 현황 조회 |
+| POST | `/admin/settlement-holds/{id}/release` | 정산 보류 수동 해제 (예외 처리용) |
+| GET | `/admin/delivery-disputes?status=open` | 배송 이의제기 대기열 |
+| POST | `/admin/delivery-disputes/{id}/resolve` | 분쟁 처리 (재배송/환급/무과실/위탁자 귀책) |
+
 ---
 
-## 8. WebSocket — 실시간 뽑기 피드
+## 8. Consignment & Settlement Service
+
+위탁자(개인 판매자)가 카드를 출품하고 정산받는 전체 흐름. 구매자 쪽 배송/검수 API는 §4에 있으며, 이 섹션은
+위탁자 온보딩과 정산 파이프라인을 다룬다. 데이터 모델은 `docs/ERD.md` §11 참고.
+
+| Method | Path | Auth | 설명 |
+|---|---|---|---|
+| POST | `/consignors/apply` | Bearer | 위탁자 신청 (본인인증, 정산 계좌 등록) |
+| GET | `/consignors/me` | Bearer(위탁자) | 내 위탁자 프로필/상태 조회 |
+| POST | `/consignors/me/consignment-submissions` | Bearer(위탁자) | 카드 위탁 출품 신청 (사진 + 희망가) |
+| GET | `/consignors/me/consignment-submissions` | Bearer(위탁자) | 내 출품 이력/심사 상태 |
+| GET | `/consignors/me/wallet` | Bearer(위탁자) | 정산 대기(pending) / 출금 가능(available) 잔액 조회 |
+| GET | `/consignors/me/ledger` | Bearer(위탁자) | 정산 원장 이력 (보류/해제/지급) |
+| POST | `/consignors/me/payouts` | Bearer(위탁자) | 출금(정산) 요청 |
+| GET | `/consignors/me/payouts/{id}` | Bearer(위탁자) | 출금 처리 상태 조회 |
+
+**정산 보류 → 해제 → 출금 흐름**
+```mermaid
+sequenceDiagram
+    participant Buyer as 구매자
+    participant API as Oripa/Shipping API
+    participant DB as PostgreSQL
+    participant Consignor as 위탁자
+
+    Buyer->>API: POST /oripa-packs/{id}/draws (위탁 카드가 걸림)
+    API->>DB: draw_logs INSERT + settlement_holds INSERT(status=held)
+    API->>DB: consignor_ledger_entries INSERT(sale_hold, +hold_amount)
+    Note over DB: consignor_wallets.pending_balance 증가, available_balance는 그대로
+    Buyer->>API: (수일 후) 배송 완료
+    Buyer->>API: POST /shipping-requests/{id}/confirm-receipt (또는 검수기한 자동 경과)
+    API->>DB: settlement_holds.status=released
+    API->>DB: consignor_ledger_entries INSERT(sale_release)
+    Note over DB: pending_balance -> available_balance 이동
+    Consignor->>API: POST /consignors/me/payouts
+    API->>DB: consignor_payouts INSERT(status=pending)
+    API->>Consignor: PG 지급대행 API 호출 → 계좌 입금
+    API->>DB: consignor_payouts.status=paid, ledger에 payout(-amount) 기록
+```
+
+**POST /consignors/me/consignment-submissions — 요청/응답 예시**
+```json
+// Request
+{
+  "card_id": 5821,
+  "requested_price": 15000,
+  "images": ["https://cdn.../front.jpg", "https://cdn.../back.jpg"]
+}
+
+// 201 Response
+{ "id": 902, "status": "submitted" }
+```
+
+**GET /consignors/me/wallet — 응답 예시**
+```json
+{ "pending_balance": 12750, "available_balance": 3400, "updated_at": "2026-07-17T12:00:00Z" }
+```
+
+**POST /consignors/me/payouts — 요청/응답 예시**
+```json
+// Request
+{ "amount": 3400 }
+
+// 202 Response
+{ "id": 550, "amount": 3400, "withholding_tax_amount": 112, "net_amount": 3288, "payout_status": "pending" }
+```
+- 실패: `422 INSUFFICIENT_AVAILABLE_BALANCE`(요청 금액이 `available_balance` 초과), `403 PAYOUT_ACCOUNT_NOT_VERIFIED`(정산 계좌 미인증).
+- 실제 계좌 이체는 플랫폼이 직접 수행하지 않고 PG의 지급대행(정산대행) API를 호출한다 — 직접 송금 구현 시 전자금융거래법상 지급대행업 등록 이슈가 발생할 수 있음.
+
+---
+
+## 9. WebSocket — 실시간 뽑기 피드
 
 `wss://api.<domain>/ws/feed`
 
@@ -538,7 +636,7 @@ GET /users/me/wallet
 
 ---
 
-## 9. 에러 코드 표준
+## 10. 에러 코드 표준
 
 | HTTP | code | 설명 |
 |---|---|---|
@@ -559,3 +657,8 @@ GET /users/me/wallet
 | 422 | `INVALID_CODE` | 이메일/전화번호 변경 인증 코드 불일치 |
 | 429 | `TOO_MANY_ATTEMPTS` | 인증 코드 시도 횟수 초과, 재발급 필요 |
 | 409 | `LAST_LOGIN_METHOD` | 마지막 남은 로그인 수단(SNS 계정) 연결 해제 시도 |
+| 422 | `INSUFFICIENT_AVAILABLE_BALANCE` | 위탁자 출금 요청 금액이 `available_balance` 초과 |
+| 403 | `PAYOUT_ACCOUNT_NOT_VERIFIED` | 위탁자 정산 계좌 미인증 상태에서 출금 시도 |
+| 409 | `DISPUTE_ALREADY_OPEN` | 이미 열린 이의제기가 있는 배송 건에 중복 제기 |
+| 410 | `INSPECTION_WINDOW_EXPIRED` | 검수 기간 경과 후 이의제기 시도 (자동 확정된 건) |
+| 409 | `CONSIGNMENT_NOT_APPROVED` | 심사 승인 전 위탁 카드가 팩에 배치되려는 시도 |

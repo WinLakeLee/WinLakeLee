@@ -17,7 +17,8 @@ GENERATED ALWAYS AS IDENTITY PK`, `created_at timestamptz DEFAULT now()`를 공�
 8. [Events & Retention](#8-events--retention)
 9. [Admin & Audit](#9-admin--audit)
 10. [Card Data Collection Pipeline (운영 데이터 수집)](#10-card-data-collection-pipeline-운영-데이터-수집)
-11. [설계 노트](#11-설계-노트)
+11. [Consignment & Marketplace Escrow (위탁 판매 & 정산 에스크로)](#11-consignment--marketplace-escrow-위탁-판매--정산-에스크로)
+12. [설계 노트](#12-설계-노트)
 
 ---
 
@@ -37,6 +38,11 @@ graph LR
     H -->|ledger debit| F
     G -->|refund_request| H
     I -->|coupon/attendance credit| H
+
+    K[Consignment & Escrow] -->|consignor_id FK, settlement_price| C
+    F -->|draw_log triggers hold| K
+    G -->|delivery confirmed / dispute| K
+    K -->|payout| L[External Bank Account]
 ```
 
 - **Auth & User**: 전 도메인의 기준(anchor) 엔티티인 `users`를 소유.
@@ -44,6 +50,7 @@ graph LR
 - **Physical Inventory → Oripa Engine**: 팩의 각 슬롯(`oripa_slots`)은 실물 카드 1장에 1:1로 고정 매핑되어 오버셀을 원천 차단.
 - **Oripa Engine → Inventory & Shipping**: 뽑기 결과가 `user_inventory`로 이동, 이후 배송 또는 환급 분기.
 - **Payment & Wallet**: 모든 포인트 증감(충전/뽑기 차감/환급/이벤트 지급)은 `ledger_entries`에 원자적으로 기록되며 `wallets.balance`는 파생 캐시.
+- **Consignment & Escrow**: 위탁받은 실물 카드가 뽑히면(`draw_log`) 정산금이 즉시 지급되지 않고 `settlement_holds`에 보류되며, 배송 완료+검수 기간 통과 또는 구매자 분쟁 여부에 따라 위탁자에게 지급(payout)되거나 보류가 취소된다.
 
 ---
 
@@ -183,7 +190,7 @@ erDiagram
         varchar card_number
         varchar name
         varchar rarity
-        jsonb attributes "게임별 가변 속성, §11 참고"
+        jsonb attributes "게임별 가변 속성, §12 참고"
         varchar source "api_sync, crawl, manual"
         timestamptz synced_at
         timestamptz created_at
@@ -327,6 +334,7 @@ erDiagram
     SHIPPING_REQUESTS ||--o{ SHIPPING_REQUEST_ITEMS : contains
     USER_INVENTORY ||--o| SHIPPING_REQUEST_ITEMS : included
     USER_INVENTORY ||--o| REFUND_REQUESTS : "refunded via"
+    USER_INVENTORY ||--o| DELIVERY_DISPUTES : "disputed via"
 
     USER_INVENTORY {
         bigint id PK
@@ -334,7 +342,7 @@ erDiagram
         bigint physical_card_id FK UK
         varchar source "draw, purchase, event"
         bigint source_ref_id "draw_logs.id 등"
-        varchar status "held, shipping_requested, shipped, refunded"
+        varchar status "held, shipping_requested, shipped, delivered, confirmed, disputed, refunded"
         timestamptz acquired_at
     }
 
@@ -342,12 +350,26 @@ erDiagram
         bigint id PK
         bigint user_id FK
         bigint address_id FK
-        varchar status "requested, preparing, shipped, delivered, cancelled"
+        varchar status "requested, preparing, shipped, delivered, confirmed, cancelled"
         varchar carrier
         varchar tracking_number
         timestamptz requested_at
         timestamptz shipped_at
         timestamptz delivered_at
+        timestamptz inspection_deadline_at "delivered_at + N일, 위탁 카드 정산 보류 해제 기준(§11)"
+        timestamptz confirmed_at "구매자 명시적 수령 확인 또는 기한 경과 자동 확정"
+    }
+
+    DELIVERY_DISPUTES {
+        bigint id PK
+        bigint user_inventory_id FK
+        bigint user_id FK
+        varchar reason "wrong_item, condition_mismatch, damaged, not_received"
+        jsonb evidence "구매자 제출 사진/설명"
+        varchar status "open, resolved_reship, resolved_refund, resolved_no_fault, resolved_penalize_consignor"
+        bigint resolved_by FK
+        timestamptz resolved_at
+        timestamptz created_at
     }
 
     SHIPPING_REQUEST_ITEMS {
@@ -371,6 +393,8 @@ erDiagram
 - `user_inventory.physical_card_id`에 UNIQUE 제약 → 동일 실물 카드가 두 유저 인벤토리에 동시 존재 불가.
 - 배송 신청은 여러 인벤토리 항목을 하나의 `shipping_requests`로 묶어(§8 "배송 통합") 배송비 절감.
 - 환급 선택 시 `refund_requests.status = paid` 전환과 동시에 `ledger_entries`에 `refund_credit` 항목 생성 (§7).
+- **수령 확인/검수 기간**: `delivered_at` 이후 `inspection_deadline_at`까지 구매자가 이의를 제기하지 않으면 자동으로 `confirmed_at`이 채워진다(또는 구매자가 직접 조기 확정). 이 시점이 위탁 카드의 정산 보류(`settlement_holds`) 해제 트리거다 — 상세는 §11.
+- `delivery_disputes`는 위탁/플랫폼 소유 카드 모두에 적용되는 공통 이의제기 창구이며, `consignor_id`가 있는 케이스는 처리 결과에 따라 §11의 정산 보류가 취소·차감될 수 있다.
 
 ---
 
@@ -581,9 +605,112 @@ CARDS.locked_fields  jsonb   -- 예: {"rarity": true, "attributes.hp": true} —
 4. 임계치 이하의 단순 갱신(오탈자 수정, 이미지 URL 갱신 등)은 즉시 반영, `card_sync_jobs.records_updated`에 카운트.
 5. 동기화 실패/rate-limit 초과 시 `status=failed` + 관리자 알림(Slack/이메일), 재시도는 다음 스케줄 또는 수동 트리거.
 
-## 11. 설계 노트
+---
 
-### 11.1 `cards.attributes` JSONB 스키마 예시 (게임별)
+## 11. Consignment & Marketplace Escrow (위탁 판매 & 정산 에스크로)
+
+개인/외부 판매자가 실물 카드를 위탁 출품하는 마켓플레이스형 거래를 지원하기 위한 도메인. 구매자 보호(§6 검수 기간)와
+**위탁자(판매자) 보호**를 동시에 만족시키는 양방향 에스크로 구조 — "뽑히면 즉시 지급"이 아니라 "배송·검수 통과 후 지급"이
+핵심이다.
+
+```mermaid
+erDiagram
+    CONSIGNORS ||--o{ CONSIGNMENT_SUBMISSIONS : submits
+    CONSIGNORS ||--o{ PHYSICAL_CARDS : "owns (consigned)"
+    PHYSICAL_CARDS ||--o| SETTLEMENT_HOLDS : "triggers on draw"
+    DRAW_LOGS ||--o| SETTLEMENT_HOLDS : creates
+    DELIVERY_DISPUTES ||--o| SETTLEMENT_HOLDS : "may reverse"
+    CONSIGNORS ||--|| CONSIGNOR_WALLETS : has
+    CONSIGNOR_WALLETS ||--o{ CONSIGNOR_LEDGER_ENTRIES : records
+    CONSIGNORS ||--o{ CONSIGNOR_PAYOUTS : "cashed out via"
+
+    CONSIGNORS {
+        bigint id PK
+        bigint user_id FK UK "위탁자도 플랫폼 회원이어야 함"
+        varchar display_name
+        varchar real_name_encrypted "AES-256 (KMS), 본인확인용"
+        varchar id_verification_status "unverified, verified"
+        varchar bank_account_encrypted "정산 계좌, AES-256 (KMS)"
+        varchar tax_id_encrypted "원천징수 신고용 식별정보, AES-256 (KMS)"
+        varchar status "pending, active, suspended"
+        timestamptz created_at
+    }
+
+    CONSIGNMENT_SUBMISSIONS {
+        bigint id PK
+        bigint consignor_id FK
+        bigint card_id FK "카드 마스터, §3 참조"
+        jsonb submitted_images "위탁자 제출 사진"
+        numeric requested_price "위탁자 희망가"
+        numeric admin_assessed_settlement_price "관리자 심사 후 확정 정산가"
+        numeric commission_rate "플랫폼 수수료율, 예: 0.15"
+        varchar status "submitted, under_review, approved, rejected, withdrawn"
+        bigint reviewed_by FK
+        timestamptz reviewed_at
+        timestamptz created_at
+    }
+
+    SETTLEMENT_HOLDS {
+        bigint id PK
+        bigint physical_card_id FK UK
+        bigint draw_log_id FK
+        bigint consignor_id FK
+        numeric hold_amount "= admin_assessed_settlement_price × (1 - commission_rate)"
+        varchar status "held, released, disputed, reversed"
+        timestamptz hold_expires_at "배송완료(delivered_at) + 검수기간, §6 inspection_deadline_at와 동기화"
+        timestamptz released_at
+        timestamptz created_at
+    }
+
+    CONSIGNOR_WALLETS {
+        bigint id PK
+        bigint consignor_id FK UK
+        numeric pending_balance "정산 보류 중 합계, 파생 캐시"
+        numeric available_balance "출금 가능 합계, 파생 캐시"
+        timestamptz updated_at
+    }
+
+    CONSIGNOR_LEDGER_ENTRIES {
+        bigint id PK
+        bigint consignor_id FK
+        varchar entry_type "sale_hold, sale_release, payout, dispute_reversal, commission_fee"
+        numeric amount "부호 있음"
+        varchar ref_type "settlement_hold, delivery_dispute, consignor_payout"
+        bigint ref_id
+        timestamptz created_at
+    }
+
+    CONSIGNOR_PAYOUTS {
+        bigint id PK
+        bigint consignor_id FK
+        numeric amount
+        numeric withholding_tax_amount "기타소득 원천징수 등, 세무 규정에 따름"
+        numeric net_amount
+        varchar payout_status "pending, processing, paid, failed"
+        varchar pg_payout_ref "PG 지급대행(정산대행) API 참조번호"
+        timestamptz requested_at
+        timestamptz paid_at
+    }
+```
+
+**설계 포인트 — 정산 에스크로 흐름**
+1. **위탁 심사**: 위탁자가 `consignment_submissions`로 카드+사진+희망가 제출 → 관리자가 실물 확인/그레이딩 후 `admin_assessed_settlement_price`, `commission_rate` 확정 → 승인 시 `physical_cards`에 `ownership_type=consigned`, `consignor_id`, `settlement_price`로 반영(§4).
+2. **보류 생성**: 위탁 카드가 오리파에서 뽑히는 순간(`draw_logs` 생성 시점) `settlement_holds`가 `status=held`로 즉시 생성되고, 동시에 `consignor_ledger_entries`에 `sale_hold`(+`hold_amount`, pending) 기록 → `consignor_wallets.pending_balance` 증가. **이 시점엔 위탁자에게 실제 지급되지 않는다** — 구매자가 아직 실물을 받지 못했기 때문.
+3. **보류 해제**: 배송 완료 후 `shipping_requests.confirmed_at`이 채워지면(구매자 명시적 확인 또는 §6 `inspection_deadline_at` 경과 자동 확정) `settlement_holds.status=released` 전환, `consignor_ledger_entries`에 `sale_release` 기록 → `pending_balance`에서 `available_balance`로 이동.
+4. **분쟁 시 처리**: 검수 기간 내 `delivery_disputes`가 열리면 보류 해제가 정지된다. 위탁자 귀책(그레이딩/사진과 실물 불일치 등)으로 판정되면 `settlement_holds.status=reversed` + `dispute_reversal` 기록으로 보류 취소, 구매자는 재배송/환급을 플랫폼 자체 재고 또는 별도 보상 재원으로 처리(위탁자에게 책임을 전가하되 구매자 피해를 위탁자 귀책 확정까지 기다리게 하지 않음).
+5. **출금**: `available_balance`가 쌓인 위탁자는 `consignor_payouts` 요청 → **플랫폼이 직접 계좌 이체하지 않고 PG의 지급대행(정산대행) API(`pg_payout_ref`)를 경유** — 플랫폼이 임의 계좌로 직접 송금하면 전자금융거래법상 지급대행업 등록 이슈가 발생할 수 있어 반드시 라이선스가 있는 PG 경유.
+6. 개인 위탁자 대상 지급은 세법상 원천징수(예: 기타소득 3.3%) 대상일 가능성이 높아 `consignor_payouts.withholding_tax_amount`로 분리 계산 — 정확한 세율/신고 의무는 세무사 자문 필요.
+
+**법적 유의사항 (요약)**
+- 위탁 판매 자체가 중고/위탁물품 취급 관련 별도 신고·등록 대상인지 사업 개시 전 법률 검토 필요(§리스크, 오리지널 계획서 §10).
+- 위탁자 정산은 "PG 지급대행 경유"가 원칙 — 직접 계좌이체 자체 구현 금지.
+- 위탁자 개인정보(실명, 계좌, 세금 식별정보)는 §2와 동일하게 컬럼 단위 암호화(AES-256, KMS).
+
+---
+
+## 12. 설계 노트
+
+### 12.1 `cards.attributes` JSONB 스키마 예시 (게임별)
 
 ```jsonc
 // Pokemon
@@ -603,14 +730,16 @@ CARDS.locked_fields  jsonb   -- 예: {"rarity": true, "attributes.hp": true} —
 ```
 공통 컬럼(`rarity`, `card_number`, `name`)만 정규화하고 나머지는 JSONB로 흡수 → 신규 게임 추가 시 스키마 마이그레이션 불필요, 대신 애플리케이션 레벨(Pydantic discriminated union)에서 게임별 검증.
 
-### 11.2 인덱스 전략(주요)
+### 12.2 인덱스 전략(주요)
 - `cards`: `(card_set_id, card_number)` UNIQUE, `attributes` GIN 인덱스(검색/필터용).
 - `physical_cards`: `serial_no` UNIQUE, `status` 부분 인덱스(`WHERE status = 'in_stock'`) — 재고 조회 최적화.
 - `oripa_slots`: `(pack_id, slot_no)` UNIQUE, `physical_card_id` UNIQUE, `(pack_id, status)` 부분 인덱스(`WHERE status='available'`) — 뽑기 시 잔여 슬롯 스캔 최적화.
 - `ledger_entries`: `(wallet_id, created_at)` 복합 인덱스, `idempotency_key` UNIQUE.
 - `draw_logs`, `audit_logs`: `created_at` BRIN 인덱스(append-only 대용량 로그).
+- `settlement_holds`: `physical_card_id` UNIQUE, `(status, hold_expires_at)` 부분 인덱스(`WHERE status='held'`) — 검수기한 만료 배치 스캔용.
+- `consignor_ledger_entries`: `(consignor_id, created_at)` 복합 인덱스.
 
-### 11.3 동시성 & 정합성 강제 요약
+### 12.3 동시성 & 정합성 강제 요약
 
 | 요구사항 | 강제 방법 |
 |---|---|
@@ -622,3 +751,5 @@ CARDS.locked_fields  jsonb   -- 예: {"rarity": true, "attributes.hp": true} —
 | 동일 SNS 계정 중복 가입 방지 | `user_oauth_accounts.(provider, provider_user_id)` UNIQUE |
 | 인증 코드 재사용/무한 시도 방지 | `verification_codes.attempt_count` 임계치 초과 시 코드 폐기, `expires_at` 경과 시 무효 |
 | 수동 보정 카드 데이터 덮어쓰기 방지 | `cards.locked_fields`에 잠긴 필드는 동기화 diff 계산에서 제외 |
+| 위탁 카드 정산금 조기 유출 방지 | `settlement_holds`는 배송 확정(`confirmed_at`) 전까지 `released`로 전환 불가 (애플리케이션 레벨 상태머신 + 배치 검증) |
+| 위탁자 정산 이중 지급 방지 | `consignor_payouts`는 `available_balance` 범위 내에서만 생성, 지급 완료 후 `consignor_ledger_entries`에 `payout` 차감 기록 |
