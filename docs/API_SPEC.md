@@ -61,16 +61,25 @@
 
 | Method | Path | Auth | 설명 |
 |---|---|---|---|
-| POST | `/auth/register` | - | 이메일 회원가입 |
+| POST | `/auth/register` | - | 이메일 회원가입 (가입 직후 `POST /auth/verify-email/request`로 이메일 인증 발송) |
 | POST | `/auth/login` | - | 이메일 로그인 → access/refresh 토큰 발급 |
-| GET | `/auth/oauth/{provider}/redirect` | - | OAuth 인가 URL 리다이렉트 (`provider`: kakao, google) |
-| POST | `/auth/oauth/{provider}/callback` | - | OAuth 콜백 처리 → 토큰 발급 |
+| GET | `/auth/oauth/{provider}/redirect` | - | OAuth 인가 URL 리다이렉트 (`provider`: kakao, naver, google, apple) |
+| POST | `/auth/oauth/{provider}/callback` | - | OAuth 콜백 처리 → 신규면 자동 회원가입, 기존이면 로그인 (§1.1) |
 | POST | `/auth/refresh` | Refresh Token | Access Token 재발급 (Rotation) |
 | POST | `/auth/logout` | Bearer | 현재 Refresh Token 폐기 |
 | POST | `/auth/2fa/enable` | Bearer | TOTP 시크릿 발급 (QR용 otpauth URI 반환) |
 | POST | `/auth/2fa/verify` | Bearer | TOTP 코드 검증 후 2FA 활성화 확정 |
-| GET | `/users/me` | Bearer | 내 프로필 조회 |
-| PATCH | `/users/me` | Bearer | 닉네임/전화번호 등 수정 |
+| GET | `/users/me` | Bearer | 내 프로필 조회 (연결된 SNS 계정 목록 포함) |
+| PATCH | `/users/me` | Bearer | 닉네임/프로필이미지 등 민감하지 않은 정보 즉시 수정 |
+| GET | `/users/me/oauth-accounts` | Bearer | 연결된 SNS 계정 목록 |
+| POST | `/users/me/oauth-accounts/link` | Bearer | 로그인 상태에서 추가 SNS 계정 연결 |
+| DELETE | `/users/me/oauth-accounts/{provider}` | Bearer | SNS 계정 연결 해제 |
+| POST | `/users/me/email-change/request` | Bearer + 비밀번호 재확인 | 신규 이메일로 인증 코드 발송 |
+| POST | `/users/me/email-change/confirm` | Bearer | 인증 코드 검증 후 이메일 변경 확정 |
+| POST | `/users/me/phone-change/request` | Bearer | 신규 전화번호로 SMS 인증 코드 발송 |
+| POST | `/users/me/phone-change/confirm` | Bearer | 인증 코드 검증 후 전화번호 변경 확정 |
+| POST | `/users/me/password` | Bearer + 현재 비밀번호 확인 | 비밀번호 변경 (전 세션 강제 로그아웃) |
+| GET | `/users/me/change-logs` | Bearer | 본인 정보 변경 이력 조회 |
 | GET | `/users/me/addresses` | Bearer | 배송지 목록 |
 | POST | `/users/me/addresses` | Bearer | 배송지 등록 |
 | PATCH | `/users/me/addresses/{id}` | Bearer | 배송지 수정 |
@@ -91,6 +100,97 @@
 }
 ```
 - 실패 시 `401 INVALID_CREDENTIALS`. 5회 연속 실패 시 캡차 요구(`428 CAPTCHA_REQUIRED`).
+
+### 1.1 SNS 회원가입/로그인 (Kakao, Naver, Google, Apple)
+
+지원 우선순위(한국 시장 기준): **카카오 → 네이버 → 구글 → 애플**. 4개 provider 모두 동일한 콜백 계약을
+따르며, provider별 클라이언트 구현만 전략 패턴으로 분리한다(`AppleOAuthClient`는 최초 로그인에만
+이름이 내려오고 private relay 이메일을 쓸 수 있다는 점만 별도 처리).
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant API as Auth API
+    participant P as SNS Provider
+    participant DB as PostgreSQL
+
+    C->>API: GET /auth/oauth/{provider}/redirect
+    API-->>C: 302 Provider 인가 URL
+    C->>P: 로그인/동의
+    P-->>C: redirect_uri?code=...
+    C->>API: POST /auth/oauth/{provider}/callback { code }
+    API->>P: code → access_token 교환, 프로필 조회
+    API->>DB: user_oauth_accounts 조회 (provider, provider_user_id)
+    alt 이미 연결된 계정 존재
+        API->>DB: 해당 users로 로그인 처리
+    else provider 이메일이 기존 users.email과 일치 + 인증됨
+        API-->>C: 200 { needs_link_confirmation: true, existing_user_masked }
+        C->>API: POST /auth/oauth/{provider}/callback { code, confirm_link: true }
+        API->>DB: user_oauth_accounts INSERT (기존 계정에 연결)
+    else 신규
+        API->>DB: users INSERT (signup_method=provider) + user_oauth_accounts INSERT
+    end
+    API-->>C: 200 access/refresh token
+```
+
+**POST /auth/oauth/{provider}/callback — 응답 예시**
+```json
+// 신규 가입 또는 기존 연결 계정 로그인
+{
+  "access_token": "eyJ...",
+  "refresh_token": "8f3a...",
+  "is_new_user": true,
+  "user": { "id": 205, "nickname": "리자몽매니아", "signup_method": "kakao" }
+}
+
+// 계정 연결 확인이 필요한 경우 (동일 이메일의 기존 이메일 가입 계정 존재)
+{
+  "needs_link_confirmation": true,
+  "existing_user_masked": { "email_masked": "us***@example.com", "signup_method": "email" },
+  "link_token": "lnk_7f2a..."
+}
+```
+- 연결 확인이 필요한 응답을 받으면 클라이언트는 사용자에게 "기존 계정과 연결하시겠습니까?"를 안내 후
+  `POST /auth/oauth/{provider}/callback`에 `link_token` + `confirm_link: true`를 재전송해 확정한다.
+- 이메일이 provider에서 인증되지 않은 상태(예: Apple private relay)로 왔다면 자동 연결 제안 없이 신규 계정으로 분리 생성(§ERD.md `user_oauth_accounts.email_verified_by_provider`).
+- 이미 로그인 상태에서 추가 SNS를 연결하려면 `POST /users/me/oauth-accounts/link`(Bearer 필요, code 교환 흐름 동일).
+- `DELETE /users/me/oauth-accounts/{provider}`는 연결 해제 후 로그인 수단이 하나도 남지 않으면(비밀번호 미설정 + SNS 계정 1개뿐) `409 LAST_LOGIN_METHOD` 반환.
+
+### 1.2 유저 정보 수정 (민감 정보 2단계 인증)
+
+이메일·전화번호·비밀번호 변경은 계정 탈취 시 피해가 큰 변경이므로 요청(request)/확정(confirm) 2단계로 분리한다.
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant API as Auth API
+    participant DB as PostgreSQL
+
+    C->>API: POST /users/me/email-change/request { new_email, current_password }
+    API->>DB: 현재 비밀번호 검증, verification_codes INSERT (purpose=email_change)
+    API-->>C: 202 { expires_in: 600 }
+    Note over API: 신규 이메일로 인증 코드 발송
+    C->>API: POST /users/me/email-change/confirm { code }
+    API->>DB: code 검증 (attempt_count 체크), users.email UPDATE, user_change_logs INSERT
+    API-->>C: 200 { email: "new@example.com" }
+```
+
+```json
+// POST /users/me/email-change/request
+// Request
+{ "new_email": "new@example.com", "current_password": "..." }
+// 202 Response
+{ "expires_in": 600 }
+
+// POST /users/me/email-change/confirm
+// Request
+{ "code": "482913" }
+// 200 Response
+{ "email": "new@example.com" }
+```
+- 실패: `401 INVALID_PASSWORD`, `409 EMAIL_ALREADY_IN_USE`, `422 INVALID_CODE`(5회 초과 시 `429 TOO_MANY_ATTEMPTS`, 코드 재발급 필요).
+- `POST /users/me/password` 성공 시 현재 세션을 제외한 모든 `refresh_tokens`를 `revoked_at` 처리(다른 기기 강제 로그아웃).
+- 모든 변경은 성공/실패 관계없이 `user_change_logs`에 기록되며, `GET /users/me/change-logs`로 본인이 직접 열람 가능(계정 이상 징후 셀프 체크).
 
 ---
 
@@ -327,13 +427,36 @@ GET /users/me/wallet
 
 모든 엔드포인트 `role=admin` 이상 + 2FA 세션 필수. 성공/실패 관계없이 `audit_logs` 기록.
 
-### 7.1 카드 마스터 관리
+### 7.1 카드 마스터 관리 & 데이터 수집 파이프라인
 | Method | Path | 설명 |
 |---|---|---|
 | POST | `/admin/cards` | 카드 단건 등록 |
-| PATCH | `/admin/cards/{id}` | 카드 수정 |
+| PATCH | `/admin/cards/{id}` | 카드 수정 (`locked_fields`에 잠글 필드 지정 가능) |
 | POST | `/admin/cards/bulk-import` | CSV 대량 업로드 (소스 없는 게임 대응) |
 | POST | `/admin/card-sets` | 세트 등록 |
+| POST | `/admin/card-sync/{source}/trigger` | 수집 파이프라인 수동 실행 (`source`: pokemontcg_io, ygoprodeck, crawler_onepiece, crawler_ws, crawler_unionarena) |
+| GET | `/admin/card-sync/jobs` | 동기화 실행 이력 조회 (`?status=failed`) |
+| GET | `/admin/card-sync/review-queue` | 자동 반영 보류된 변경분 조회 |
+| POST | `/admin/card-sync/review-queue/{id}/approve` | 리뷰 항목 승인 → `cards`에 반영 |
+| POST | `/admin/card-sync/review-queue/{id}/reject` | 리뷰 항목 반려 |
+
+**GET /admin/card-sync/review-queue — 응답 예시**
+```json
+{
+  "data": [
+    {
+      "id": 501,
+      "sync_job_id": 88,
+      "card_id": 5821,
+      "change_type": "field_update",
+      "diff": { "rarity": { "old": "SR", "new": "SAR" } },
+      "status": "pending"
+    }
+  ]
+}
+```
+- 신규 카드 대량 등록(예: 확장팩 발매), 가격/희귀도 급변 등 임계치를 초과하는 변경은 자동 반영되지 않고 이 큐에 쌓인다 (§ERD.md §10 참고). 단순 오탈자·이미지 URL 갱신 등은 즉시 반영되어 큐에 나타나지 않는다.
+- `cards.locked_fields`로 잠근 필드는 수집 파이프라인이 애초에 diff 대상에서 제외 — 관리자가 수동 보정한 값이 다음 동기화에서 덮어써지지 않음.
 
 ### 7.2 실물 재고 관리
 | Method | Path | 설명 |
@@ -366,10 +489,23 @@ GET /users/me/wallet
 | Method | Path | 설명 |
 |---|---|---|
 | GET | `/admin/users` | 유저 목록/검색 |
+| GET | `/admin/users/{id}` | 유저 상세 (연결 SNS 계정, 변경 이력 요약 포함) |
+| PATCH | `/admin/users/{id}` | 관리자에 의한 유저 정보 강제 수정 (닉네임/이메일/전화번호/배송지) |
 | PATCH | `/admin/users/{id}/status` | 계정 정지/복구 |
+| GET | `/admin/users/{id}/change-logs` | 해당 유저의 전체 변경 이력(본인+관리자) 조회 |
 | GET | `/admin/refund-requests?status=pending` | 환급 신청 대기열 |
 | POST | `/admin/refund-requests/{id}/approve` | 환급 승인 (ledger 반영) |
 | POST | `/admin/shipping-requests/{id}/ship` | 송장번호 등록, 배송 처리 |
+
+**PATCH /admin/users/{id} — 요청/응답 예시**
+```json
+// Request
+{ "phone": "010-1234-5678", "reason": "CS 요청에 따른 배송지 연락처 정정" }
+
+// 200 Response
+{ "id": 205, "phone_masked": "010-****-5678", "updated_at": "2026-07-17T11:00:00Z" }
+```
+- 본인 확인 절차(이메일/SMS 인증) 없이 즉시 반영되지만, `reason` 필드는 필수이며 `user_change_logs.changed_by='admin'` + `admin_user_id` + `audit_logs`에 이중 기록.
 
 ### 7.5 대시보드 & 감사
 | Method | Path | 설명 |
@@ -418,3 +554,8 @@ GET /users/me/wallet
 | 428 | `CAPTCHA_REQUIRED` | 반복 실패로 캡차 요구 |
 | 429 | `RATE_LIMITED` | 레이트 리밋 초과 |
 | 500 | `INTERNAL_ERROR` | 서버 오류 |
+| 401 | `INVALID_PASSWORD` | 민감 정보 변경 시 현재 비밀번호 재확인 실패 |
+| 409 | `EMAIL_ALREADY_IN_USE` | 이메일 변경/SNS 연결 시 대상 이메일이 이미 사용 중 |
+| 422 | `INVALID_CODE` | 이메일/전화번호 변경 인증 코드 불일치 |
+| 429 | `TOO_MANY_ATTEMPTS` | 인증 코드 시도 횟수 초과, 재발급 필요 |
+| 409 | `LAST_LOGIN_METHOD` | 마지막 남은 로그인 수단(SNS 계정) 연결 해제 시도 |

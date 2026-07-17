@@ -16,7 +16,8 @@ GENERATED ALWAYS AS IDENTITY PK`, `created_at timestamptz DEFAULT now()`를 공�
 7. [Payment & Wallet (복식 원장)](#7-payment--wallet-복식-원장)
 8. [Events & Retention](#8-events--retention)
 9. [Admin & Audit](#9-admin--audit)
-10. [설계 노트](#10-설계-노트)
+10. [Card Data Collection Pipeline (운영 데이터 수집)](#10-card-data-collection-pipeline-운영-데이터-수집)
+11. [설계 노트](#11-설계-노트)
 
 ---
 
@@ -53,15 +54,17 @@ erDiagram
     USERS ||--o{ USER_ADDRESSES : has
     USERS ||--o{ REFRESH_TOKENS : has
     USERS ||--o| USER_2FA : has
+    USERS ||--o{ USER_OAUTH_ACCOUNTS : links
+    USERS ||--o{ USER_CHANGE_LOGS : "audited by"
+    USERS ||--o{ VERIFICATION_CODES : requests
 
     USERS {
         bigint id PK
-        varchar email UK
-        varchar password_hash "nullable if oauth-only, Argon2id"
+        varchar email UK "SNS 전용 가입은 provider 이메일로 채움, nullable 아님"
+        varchar password_hash "nullable, SNS 전용 계정은 NULL, Argon2id"
         varchar nickname UK
-        varchar phone_encrypted "AES-256 (KMS)"
-        varchar oauth_provider "kakao, google, null"
-        varchar oauth_id
+        varchar phone_encrypted "AES-256 (KMS), nullable"
+        varchar signup_method "email, kakao, naver, google, apple — 최초 가입 경로(통계/정책용, 불변)"
         varchar role "user, admin, super_admin"
         varchar status "active, suspended, withdrawn"
         timestamptz last_login_at
@@ -99,12 +102,50 @@ erDiagram
         boolean enabled
         timestamptz enabled_at
     }
+
+    USER_OAUTH_ACCOUNTS {
+        bigint id PK
+        bigint user_id FK
+        varchar provider "kakao, naver, google, apple"
+        varchar provider_user_id UK "provider+provider_user_id 복합 UNIQUE"
+        varchar email_from_provider
+        boolean email_verified_by_provider
+        timestamptz connected_at
+        timestamptz last_used_at
+    }
+
+    USER_CHANGE_LOGS {
+        bigint id PK
+        bigint user_id FK
+        varchar field "email, phone, password, nickname, address, status, role ..."
+        varchar old_value_masked
+        varchar new_value_masked
+        varchar changed_by "self, admin"
+        bigint admin_user_id FK "changed_by=admin일 때만"
+        varchar ip_address
+        timestamptz created_at
+    }
+
+    VERIFICATION_CODES {
+        bigint id PK
+        bigint user_id FK
+        varchar purpose "email_change, phone_change, signup_email, password_reset"
+        varchar target "변경 대상 이메일/전화번호"
+        varchar code_hash "SHA-256(code), 평문 미저장"
+        int attempt_count
+        timestamptz expires_at "발급 후 5~10분"
+        timestamptz verified_at
+        timestamptz created_at
+    }
 ```
 
 **설계 포인트**
 - Refresh Token Rotation: 매 갱신 시 기존 토큰 `revoked_at` 세팅 후 신규 행 삽입. 탈취 감지를 위해 재사용 시도 시 해당 유저의 전체 세션 강제 만료.
 - 배송지는 컬럼 단위 암호화(AES-256, KMS). 인덱싱이 필요한 zipcode만 평문 유지.
 - `role`은 admin 전용 라우트 게이트에 사용, 세분화된 권한은 §9 `admin_permissions` 참고.
+- **SNS 계정은 `user_oauth_accounts`로 분리**(1:N) — 기존 `users.oauth_provider/oauth_id` 단일 컬럼 설계로는 한 유저가 카카오+네이버를 동시에 연결할 수 없어 확장. `UNIQUE(provider, provider_user_id)`로 동일 SNS 계정의 중복 유저 생성을 방지.
+- **계정 연결(Account Linking)**: SNS 최초 로그인 시 `email_from_provider`가 기존 `users.email`과 일치하고 `email_verified_by_provider = true`인 경우에만 자동 연결 제안. 그렇지 않으면 신규 계정으로 분리 생성(이메일 스푸핑 방지) — §API 명세 3.항 참고.
+- 이메일/전화번호 변경, 비밀번호 변경 등 민감 정보 수정은 `verification_codes`로 2단계 인증 후 확정하며, 성공 여부와 무관하게 `user_change_logs`에 감사 기록(본인 변경 포함 — 계정 탈취 대응 근거자료).
 
 ---
 
@@ -142,7 +183,7 @@ erDiagram
         varchar card_number
         varchar name
         varchar rarity
-        jsonb attributes "게임별 가변 속성, §10 참고"
+        jsonb attributes "게임별 가변 속성, §11 참고"
         varchar source "api_sync, crawl, manual"
         timestamptz synced_at
         timestamptz created_at
@@ -475,9 +516,70 @@ erDiagram
 
 ---
 
-## 10. 설계 노트
+## 10. Card Data Collection Pipeline (운영 데이터 수집)
 
-### 10.1 `cards.attributes` JSONB 스키마 예시 (게임별)
+카드 마스터 데이터(§3)를 최신 상태로 유지하기 위한 수집 파이프라인의 실행 이력·리뷰 큐 모델.
+소스별 흐름과 API는 계획서 §3.1 및 `API_SPEC.md` §7.1을 참고.
+
+```mermaid
+erDiagram
+    GAMES ||--o{ CARD_SYNC_JOBS : "synced by"
+    CARD_SYNC_JOBS ||--o{ CARD_SYNC_REVIEW_ITEMS : produces
+    CARDS ||--o| CARD_SYNC_REVIEW_ITEMS : "affects (nullable, 신규 카드는 NULL)"
+
+    CARD_SYNC_JOBS {
+        bigint id PK
+        bigint game_id FK
+        varchar source "pokemontcg_io, ygoprodeck, crawler_onepiece, crawler_ws, crawler_unionarena, manual_csv"
+        varchar status "running, succeeded, failed, partially_failed"
+        int records_fetched
+        int records_created
+        int records_updated
+        int records_flagged "리뷰 큐로 넘어간 건수"
+        text error_message
+        timestamptz started_at
+        timestamptz finished_at
+    }
+
+    CARD_SYNC_REVIEW_ITEMS {
+        bigint id PK
+        bigint sync_job_id FK
+        bigint card_id FK "기존 카드 갱신 시에만, 신규 카드는 NULL"
+        varchar change_type "new_card, field_update, price_spike, possible_duplicate"
+        jsonb diff "필드별 old/new 값"
+        varchar status "pending, approved, rejected"
+        bigint reviewed_by FK
+        timestamptz reviewed_at
+        timestamptz created_at
+    }
+```
+
+`cards` 테이블에는 필드 단위 수동 잠금을 위한 컬럼을 추가한다 (§3 원본 정의에 대한 보강):
+
+```
+CARDS.locked_fields  jsonb   -- 예: {"rarity": true, "attributes.hp": true} — true인 필드는 자동 동기화가 덮어쓰지 않음
+```
+
+**소스별 수집 전략**
+
+| 게임 | 수집 방식 | 주기 | 비고 |
+|---|---|---|---|
+| Pokemon | PokemonTCG.io REST API | 매일 03:00 (Celery beat) | 공식 API, 페이지네이션 + rate limit 준수 |
+| Yu-Gi-Oh! | YGOPRODeck API | 매일 03:10 | 공식 API |
+| One Piece | 공식 카드리스트 크롤러 + 관리자 수동 보정 | 주 1회 + 신규 세트 발매 시 수동 트리거 | robots.txt/ToS 확인, 요청 간격 제한 |
+| Weiss Schwarz | 공식 DB 크롤러 + 수동 | 주 1회 | 상동 |
+| Union Arena | 공식 DB 크롤러 + 수동 | 주 1회 | 상동 |
+
+**파이프라인 동작 원칙**
+1. 소스 fetch → 정규화(공통 스키마 매핑) → 기존 `cards`와 필드 단위 diff 계산.
+2. `locked_fields`에 잠긴 필드는 diff에서 제외(관리자 수동 보정값 보호).
+3. diff 규모가 임계치(예: 신규 카드 50건 이상, 특정 필드 가격/희귀도 급변)를 넘으면 **자동 반영하지 않고** `card_sync_review_items`에 적재 후 관리자 승인 대기.
+4. 임계치 이하의 단순 갱신(오탈자 수정, 이미지 URL 갱신 등)은 즉시 반영, `card_sync_jobs.records_updated`에 카운트.
+5. 동기화 실패/rate-limit 초과 시 `status=failed` + 관리자 알림(Slack/이메일), 재시도는 다음 스케줄 또는 수동 트리거.
+
+## 11. 설계 노트
+
+### 11.1 `cards.attributes` JSONB 스키마 예시 (게임별)
 
 ```jsonc
 // Pokemon
@@ -497,14 +599,14 @@ erDiagram
 ```
 공통 컬럼(`rarity`, `card_number`, `name`)만 정규화하고 나머지는 JSONB로 흡수 → 신규 게임 추가 시 스키마 마이그레이션 불필요, 대신 애플리케이션 레벨(Pydantic discriminated union)에서 게임별 검증.
 
-### 10.2 인덱스 전략(주요)
+### 11.2 인덱스 전략(주요)
 - `cards`: `(card_set_id, card_number)` UNIQUE, `attributes` GIN 인덱스(검색/필터용).
 - `physical_cards`: `serial_no` UNIQUE, `status` 부분 인덱스(`WHERE status = 'in_stock'`) — 재고 조회 최적화.
 - `oripa_slots`: `(pack_id, slot_no)` UNIQUE, `physical_card_id` UNIQUE, `(pack_id, status)` 부분 인덱스(`WHERE status='available'`) — 뽑기 시 잔여 슬롯 스캔 최적화.
 - `ledger_entries`: `(wallet_id, created_at)` 복합 인덱스, `idempotency_key` UNIQUE.
 - `draw_logs`, `audit_logs`: `created_at` BRIN 인덱스(append-only 대용량 로그).
 
-### 10.3 동시성 & 정합성 강제 요약
+### 11.3 동시성 & 정합성 강제 요약
 
 | 요구사항 | 강제 방법 |
 |---|---|
@@ -512,4 +614,7 @@ erDiagram
 | 동일 슬롯 중복 뽑기 방지 | `SELECT FOR UPDATE SKIP LOCKED` + Redis 분산 락 + `draw_logs.slot_id` UNIQUE |
 | 중복 충전/웹훅 재처리 방지 | `payment_transactions.pg_tid` UNIQUE, `ledger_entries.idempotency_key` UNIQUE |
 | 포인트 잔액 위변조 방지 | `wallets.balance`는 트리거로만 갱신, 애플리케이션 직접 UPDATE 금지(뷰/함수 경유) |
-| 감사 로그 불변성 | `draw_logs`, `audit_logs`에 UPDATE/DELETE 권한 미부여 (append-only role) |
+| 감사 로그 불변성 | `draw_logs`, `audit_logs`, `user_change_logs`에 UPDATE/DELETE 권한 미부여 (append-only role) |
+| 동일 SNS 계정 중복 가입 방지 | `user_oauth_accounts.(provider, provider_user_id)` UNIQUE |
+| 인증 코드 재사용/무한 시도 방지 | `verification_codes.attempt_count` 임계치 초과 시 코드 폐기, `expires_at` 경과 시 무효 |
+| 수동 보정 카드 데이터 덮어쓰기 방지 | `cards.locked_fields`에 잠긴 필드는 동기화 diff 계산에서 제외 |
