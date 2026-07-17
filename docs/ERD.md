@@ -232,7 +232,10 @@ erDiagram
         varchar condition_grade "S/A/B/C 또는 NM/LP/MP/HP/DMG"
         text condition_note
         varchar status "in_stock, allocated, shipped, refunded, lost"
-        numeric acquired_cost "매입 원가, 마진 계산용"
+        varchar ownership_type "platform_owned, consigned — §11 참고"
+        bigint consignor_id FK "ownership_type=consigned일 때만, §11 CONSIGNORS 참조"
+        numeric settlement_price "위탁 카드가 뽑혀 확정될 때 위탁자에게 지급할 금액, consigned 전용"
+        numeric acquired_cost "매입 원가(platform_owned), 마진 계산용"
         timestamptz created_at
     }
 
@@ -250,6 +253,7 @@ erDiagram
 - `physical_cards`가 실물 재고의 **단일 진실 공급원(SSOT)**. `oripa_slots.physical_card_id`가 여기를 참조하므로 슬롯:실물 = 1:1이 DB 레벨(UNIQUE 제약)로 강제됨.
 - `status = allocated`는 팩에 배치되었지만 아직 안 뽑힌 상태, `shipped`/`refunded`는 §6 인벤토리 처리 결과와 동기화.
 - 실물 촬영 이미지는 관리자 업로드 시 리사이즈·워터마크 파이프라인(Celery)을 거쳐 `physical_card_images`에 다건 저장.
+- `ownership_type=consigned` 카드는 `consignor_id`/`settlement_price`가 채워지며, 뽑힌 뒤 정산 보류(에스크로) 흐름을 탄다 — 상세 설계는 §11.
 
 ---
 
